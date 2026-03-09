@@ -37,6 +37,7 @@ pub struct OpenRequest {
     pub open_paths: Vec<String>,
     pub diff_paths: Vec<[String; 2]>,
     pub diff_all: bool,
+    pub dev_container: bool,
     pub open_channel_notes: Vec<(u64, Option<String>)>,
     pub join_channel: Option<u64>,
     pub remote_connection: Option<RemoteConnectionOptions>,
@@ -78,6 +79,7 @@ impl OpenRequest {
 
         this.diff_paths = request.diff_paths;
         this.diff_all = request.diff_all;
+        this.dev_container = request.dev_container;
         if let Some(wsl) = request.wsl {
             let (user, distro_name) = if let Some((user, distro)) = wsl.split_once('@') {
                 if user.is_empty() {
@@ -256,6 +258,7 @@ pub struct RawOpenRequest {
     pub urls: Vec<String>,
     pub diff_paths: Vec<[String; 2]>,
     pub diff_all: bool,
+    pub dev_container: bool,
     pub wsl: Option<String>,
 }
 
@@ -409,6 +412,7 @@ pub async fn handle_cli_connection(
                 reuse,
                 env,
                 user_data_dir: _,
+                dev_container,
             } => {
                 if !urls.is_empty() {
                     cx.update(|cx| {
@@ -417,6 +421,7 @@ pub async fn handle_cli_connection(
                                 urls,
                                 diff_paths,
                                 diff_all,
+                                dev_container,
                                 wsl,
                             },
                             cx,
@@ -446,6 +451,7 @@ pub async fn handle_cli_connection(
                     reuse,
                     &responses,
                     wait,
+                    dev_container,
                     app_state.clone(),
                     env,
                     cx,
@@ -467,6 +473,7 @@ async fn open_workspaces(
     reuse: bool,
     responses: &IpcSender<CliResponse>,
     wait: bool,
+    dev_container: bool,
     app_state: Arc<AppState>,
     env: Option<collections::HashMap<String, String>>,
     cx: &mut AsyncApp,
@@ -543,6 +550,7 @@ async fn open_workspaces(
                     diff_paths.clone(),
                     diff_all,
                     open_options,
+                    dev_container,
                     responses,
                     &app_state,
                     cx,
@@ -587,6 +595,7 @@ async fn open_local_workspace(
     diff_paths: Vec<[String; 2]>,
     diff_all: bool,
     open_options: workspace::OpenOptions,
+    dev_container: bool,
     responses: &IpcSender<CliResponse>,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
@@ -614,6 +623,17 @@ async fn open_local_workspace(
             return true;
         }
     };
+
+    if dev_container {
+        workspace
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(zed_actions::OpenDevContainer),
+                    cx,
+                );
+            })
+            .log_err();
+    }
 
     let mut errored = false;
     let mut item_release_futures = Vec::new();

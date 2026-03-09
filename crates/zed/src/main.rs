@@ -849,6 +849,7 @@ fn main() {
                 diff_paths,
                 wsl,
                 diff_all: diff_all_mode,
+                dev_container: args.dev_container,
             })
         }
 
@@ -1200,12 +1201,13 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     }
 
     let mut task = None;
+    let dev_container = request.dev_container;
     if !request.open_paths.is_empty() || !request.diff_paths.is_empty() {
         let app_state = app_state.clone();
         task = Some(cx.spawn(async move |cx| {
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-            let (_window, results) = open_paths_with_positions(
+            let (window, results) = open_paths_with_positions(
                 &paths_with_position,
                 &request.diff_paths,
                 request.diff_all,
@@ -1214,6 +1216,16 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 cx,
             )
             .await?;
+            if dev_container {
+                window
+                    .update(cx, |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(zed_actions::OpenDevContainer),
+                            cx,
+                        );
+                    })
+                    .log_err();
+            }
             for result in results.into_iter().flatten() {
                 if let Err(err) = result {
                     log::error!("Error opening path: {err}",);
@@ -1624,6 +1636,13 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long, value_name = "USER@DISTRO")]
     wsl: Option<String>,
+
+    /// Open the project in a dev container.
+    ///
+    /// Automatically triggers "Reopen in Dev Container" if a `.devcontainer/`
+    /// configuration is found in the project directory.
+    #[arg(long)]
+    dev_container: bool,
 
     /// Instructs zed to run as a dev server on this machine. (not implemented)
     #[arg(long)]
