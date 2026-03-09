@@ -721,6 +721,14 @@ pub(crate) async fn dispatch_dev_container_action(
                 return None;
             }
 
+            let all_single_file_worktrees = project
+                .read(cx)
+                .worktrees(cx)
+                .all(|worktree| worktree.read(cx).is_single_file());
+            if all_single_file_worktrees {
+                return None;
+            }
+
             let tx = std::cell::Cell::new(Some(tx));
             Some(cx.subscribe_in(
                 &project,
