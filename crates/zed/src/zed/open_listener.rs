@@ -717,8 +717,9 @@ pub(crate) async fn dispatch_dev_container_action(
     // Wait for the worktree scan to populate the project directory.
     // The scan is async, so `active_project_directory` may return None
     // immediately after the workspace opens.
+    let mut ready = false;
     for _ in 0..100 {
-        let ready = workspace_handle
+        ready = workspace_handle
             .update(cx, |multi_workspace, _window, cx| {
                 multi_workspace
                     .workspace()
@@ -735,6 +736,11 @@ pub(crate) async fn dispatch_dev_container_action(
         }
 
         executor.timer(Duration::from_millis(50)).await;
+    }
+
+    if !ready {
+        log::error!("Timed out waiting for project directory for --dev-container flag");
+        return;
     }
 
     workspace_handle
