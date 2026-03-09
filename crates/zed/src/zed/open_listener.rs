@@ -625,14 +625,7 @@ async fn open_local_workspace(
     };
 
     if dev_container {
-        workspace
-            .update(cx, |_, window, cx| {
-                window.dispatch_action(
-                    Box::new(zed_actions::OpenDevContainer),
-                    cx,
-                );
-            })
-            .log_err();
+        dispatch_dev_container_action(workspace, cx).await;
     }
 
     let mut errored = false;
@@ -713,6 +706,49 @@ async fn open_local_workspace(
     }
 
     errored
+}
+
+pub(crate) async fn dispatch_dev_container_action(
+    workspace: WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) {
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let subscription = workspace
+        .update(cx, |multi_workspace, window, cx| {
+            let project = multi_workspace.workspace().read(cx).project().clone();
+            if project.read(cx).active_project_directory(cx).is_some() {
+                return None;
+            }
+
+            let tx = std::cell::Cell::new(Some(tx));
+            Some(cx.subscribe_in(
+                &project,
+                window,
+                move |_, project, event, _, cx| {
+                    if matches!(event, project::Event::WorktreeUpdatedEntries(..)) {
+                        if project.read(cx).active_project_directory(cx).is_some() {
+                            if let Some(tx) = tx.take() {
+                                tx.send(()).ok();
+                            }
+                        }
+                    }
+                },
+            ))
+        })
+        .ok()
+        .flatten();
+
+    if subscription.is_some() {
+        rx.await.ok();
+    }
+    drop(subscription);
+
+    workspace
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
+        })
+        .log_err();
 }
 
 pub async fn derive_paths_with_position(

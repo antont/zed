@@ -60,9 +60,9 @@ use workspace::{
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
-    derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, handle_settings_file_changes, initialize_workspace,
-    open_paths_with_positions,
+    derive_paths_with_position, dispatch_dev_container_action, edit_prediction_registry,
+    handle_cli_connection, handle_keymap_file_changes, handle_settings_file_changes,
+    initialize_workspace, open_paths_with_positions,
 };
 
 use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
@@ -1217,14 +1217,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             )
             .await?;
             if dev_container {
-                window
-                    .update(cx, |_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(zed_actions::OpenDevContainer),
-                            cx,
-                        );
-                    })
-                    .log_err();
+                dispatch_dev_container_action(window, cx).await;
             }
             for result in results.into_iter().flatten() {
                 if let Err(err) = result {
