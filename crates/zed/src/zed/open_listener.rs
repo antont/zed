@@ -709,44 +709,61 @@ async fn open_local_workspace(
 }
 
 pub(crate) async fn dispatch_dev_container_action(
-    workspace: WindowHandle<MultiWorkspace>,
+    workspace_handle: WindowHandle<MultiWorkspace>,
     cx: &mut AsyncApp,
 ) {
-    let (tx, rx) = oneshot::channel::<()>();
+    let executor = cx.background_executor().clone();
 
-    let subscription = workspace
-        .update(cx, |multi_workspace, window, cx| {
-            let project = multi_workspace.workspace().read(cx).project().clone();
-            if project.read(cx).active_project_directory(cx).is_some() {
-                return None;
-            }
+    // Wait for the worktree scan to populate the project directory.
+    // The scan is async, so `active_project_directory` may return None
+    // immediately after the workspace opens.
+    for _ in 0..100 {
+        let ready = workspace_handle
+            .update(cx, |multi_workspace, _window, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .active_project_directory(cx)
+                    .is_some()
+            })
+            .unwrap_or(false);
 
-            let tx = std::cell::Cell::new(Some(tx));
-            Some(cx.subscribe_in(
-                &project,
-                window,
-                move |_, project, event, _, cx| {
-                    if matches!(event, project::Event::WorktreeUpdatedEntries(..)) {
-                        if project.read(cx).active_project_directory(cx).is_some() {
-                            if let Some(tx) = tx.take() {
-                                tx.send(()).ok();
-                            }
-                        }
-                    }
-                },
-            ))
-        })
-        .ok()
-        .flatten();
+        if ready {
+            break;
+        }
 
-    if subscription.is_some() {
-        rx.await.ok();
+        executor.timer(Duration::from_millis(50)).await;
     }
-    drop(subscription);
 
-    workspace
-        .update(cx, |_, window, cx| {
-            window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
+    workspace_handle
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.workspace().update(cx, |workspace, cx| {
+                if !workspace.project().read(cx).is_local() {
+                    log::error!("Cannot open dev container from remote project");
+                    return;
+                }
+
+                let fs = workspace.project().read(cx).fs().clone();
+                let configs =
+                    dev_container::find_devcontainer_configs(workspace, cx);
+                let app_state = workspace.app_state().clone();
+                let dev_container_context =
+                    dev_container::DevContainerContext::from_workspace(workspace, cx);
+                let handle = cx.entity().downgrade();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    recent_projects::RemoteServerProjects::new_dev_container(
+                        fs,
+                        configs,
+                        app_state,
+                        dev_container_context,
+                        window,
+                        handle,
+                        cx,
+                    )
+                });
+            });
         })
         .log_err();
 }
