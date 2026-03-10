@@ -37,11 +37,13 @@ pub fn suggest_on_worktree_updated(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let cli_auto_open = workspace.open_in_dev_container();
+
     let devcontainer_updated = updated_entries.iter().any(|(path, _, _)| {
         path.as_ref() == devcontainer_dir_path() || path.as_ref() == devcontainer_json_path()
     });
 
-    if !devcontainer_updated {
+    if !devcontainer_updated && !cli_auto_open {
         return;
     }
 
@@ -55,34 +57,47 @@ pub fn suggest_on_worktree_updated(
         return;
     }
 
-    if find_configs_in_snapshot(worktree).is_empty() {
+    let has_configs = !find_configs_in_snapshot(worktree).is_empty();
+
+    if cli_auto_open {
+        if has_configs {
+            workspace.set_open_in_dev_container(false);
+            cx.on_next_frame(window, move |workspace, window, cx| {
+                if !workspace.project().read(cx).is_local() {
+                    return;
+                }
+
+                let fs = workspace.project().read(cx).fs().clone();
+                let configs = find_devcontainer_configs(workspace, cx);
+                let app_state = workspace.app_state().clone();
+                let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
+                let handle = cx.entity().downgrade();
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RemoteServerProjects::new_dev_container(
+                        fs,
+                        configs,
+                        app_state,
+                        dev_container_context,
+                        window,
+                        handle,
+                        cx,
+                    )
+                });
+            });
+            return;
+        }
+
+        let scan_complete = worktree.completed_scan_id() >= worktree.scan_id();
+        if scan_complete {
+            workspace.set_open_in_dev_container(false);
+            log::warn!(
+                "--dev-container: no devcontainer configuration found in project"
+            );
+        }
         return;
     }
 
-    if workspace.open_in_dev_container() {
-        workspace.set_open_in_dev_container(false);
-        cx.on_next_frame(window, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
-                return;
-            }
-
-            let fs = workspace.project().read(cx).fs().clone();
-            let configs = find_devcontainer_configs(workspace, cx);
-            let app_state = workspace.app_state().clone();
-            let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
-            let handle = cx.entity().downgrade();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                RemoteServerProjects::new_dev_container(
-                    fs,
-                    configs,
-                    app_state,
-                    dev_container_context,
-                    window,
-                    handle,
-                    cx,
-                )
-            });
-        });
+    if !has_configs {
         return;
     }
 
