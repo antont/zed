@@ -1611,4 +1611,66 @@ mod tests {
             })
             .unwrap();
     }
+
+    #[gpui::test]
+    async fn test_dev_container_flag_cleared_without_config(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| recent_projects::init(cx));
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    "src": {
+                        "main.rs": "fn main() {}"
+                    }
+                }),
+            )
+            .await;
+
+        let (response_tx, _) = ipc::channel::<CliResponse>().unwrap();
+        let errored = cx
+            .spawn({
+                let app_state = app_state.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![path!("/project").to_owned()],
+                        vec![],
+                        false,
+                        workspace::OpenOptions {
+                            open_in_dev_container: true,
+                            ..Default::default()
+                        },
+                        &response_tx,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(!errored);
+
+        // Let any pending worktree scan events and updates settle.
+        cx.run_until_parked();
+
+        // With no .devcontainer config, the flag should be cleared once the
+        // worktree scan completes, rather than persisting on the workspace.
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                let flag = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .open_in_dev_container();
+                assert!(
+                    !flag,
+                    "open_in_dev_container flag should be cleared when no devcontainer config exists"
+                );
+            })
+            .unwrap();
+    }
 }
