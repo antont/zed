@@ -13,6 +13,33 @@ use worktree::UpdatedEntriesSet;
 
 const DEV_CONTAINER_SUGGEST_KEY: &str = "dev_container_suggest_dismissed";
 
+fn open_dev_container_modal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if !workspace.project().read(cx).is_local() {
+        return;
+    }
+
+    let fs = workspace.project().read(cx).fs().clone();
+    let configs = find_devcontainer_configs(workspace, cx);
+    let app_state = workspace.app_state().clone();
+    let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
+    let handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RemoteServerProjects::new_dev_container(
+            fs,
+            configs,
+            app_state,
+            dev_container_context,
+            window,
+            handle,
+            cx,
+        )
+    });
+}
+
 fn devcontainer_dir_path() -> &'static RelPath {
     static PATH: LazyLock<&'static RelPath> =
         LazyLock::new(|| RelPath::unix(".devcontainer").expect("valid path"));
@@ -63,27 +90,7 @@ pub fn suggest_on_worktree_updated(
         workspace.set_open_in_dev_container(false);
         if has_configs {
             cx.on_next_frame(window, move |workspace, window, cx| {
-                if !workspace.project().read(cx).is_local() {
-                    return;
-                }
-
-                let fs = workspace.project().read(cx).fs().clone();
-                let configs = find_devcontainer_configs(workspace, cx);
-                let app_state = workspace.app_state().clone();
-                let dev_container_context =
-                    DevContainerContext::from_workspace(workspace, cx);
-                let handle = cx.entity().downgrade();
-                workspace.toggle_modal(window, cx, |window, cx| {
-                    RemoteServerProjects::new_dev_container(
-                        fs,
-                        configs,
-                        app_state,
-                        dev_container_context,
-                        window,
-                        handle,
-                        cx,
-                    )
-                });
+                open_dev_container_modal(workspace, window, cx);
             });
         } else {
             cx.spawn_in(window, async move |workspace, cx| {
@@ -100,27 +107,7 @@ pub fn suggest_on_worktree_updated(
                         .worktrees(cx)
                         .any(|wt| !find_configs_in_snapshot(wt.read(cx)).is_empty());
                     if has_configs {
-                        if !workspace.project().read(cx).is_local() {
-                            return;
-                        }
-
-                        let fs = workspace.project().read(cx).fs().clone();
-                        let configs = find_devcontainer_configs(workspace, cx);
-                        let app_state = workspace.app_state().clone();
-                        let dev_container_context =
-                            DevContainerContext::from_workspace(workspace, cx);
-                        let handle = cx.entity().downgrade();
-                        workspace.toggle_modal(window, cx, |window, cx| {
-                            RemoteServerProjects::new_dev_container(
-                                fs,
-                                configs,
-                                app_state,
-                                dev_container_context,
-                                window,
-                                handle,
-                                cx,
-                            )
-                        });
+                        open_dev_container_modal(workspace, window, cx);
                     } else {
                         log::warn!(
                             "--dev-container: no devcontainer configuration found in project"
