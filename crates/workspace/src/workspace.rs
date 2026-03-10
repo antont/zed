@@ -1336,6 +1336,7 @@ pub struct Workspace {
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
     open_in_dev_container: bool,
+    _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
 }
 
@@ -1743,6 +1744,7 @@ impl Workspace {
             last_open_dock_positions: Vec::new(),
             removing: false,
             open_in_dev_container: false,
+            _dev_container_task: None,
         }
     }
 
@@ -2539,6 +2541,10 @@ impl Workspace {
         self.open_in_dev_container
     }
 
+    pub fn set_dev_container_task(&mut self, task: Task<Result<()>>) {
+        self._dev_container_task = Some(task);
+    }
+
     pub fn debugger_provider(&self) -> Option<Arc<dyn DebuggerProvider>> {
         self.debugger_provider.clone()
     }
@@ -2759,7 +2765,6 @@ impl Workspace {
         self.project.read(cx).visible_worktrees(cx)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn worktree_scans_complete(&self, cx: &App) -> impl Future<Output = ()> + 'static + use<> {
         let futures = self
             .worktrees(cx)

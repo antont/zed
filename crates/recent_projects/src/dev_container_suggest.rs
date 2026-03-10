@@ -88,35 +88,35 @@ pub fn suggest_on_worktree_updated(
 
     if cli_auto_open {
         workspace.set_open_in_dev_container(false);
-        if has_configs {
-            cx.on_next_frame(window, move |workspace, window, cx| {
-                open_dev_container_modal(workspace, window, cx);
-            });
-        } else {
-            cx.spawn_in(window, async move |workspace, cx| {
-                let scans_complete = workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.worktree_scans_complete(cx)
-                    })?;
-                scans_complete.await;
+        let task = cx.spawn_in(window, async move |workspace, cx| {
+            let scans_complete = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.worktree_scans_complete(cx)
+                })?;
+            scans_complete.await;
 
-                workspace.update_in(cx, |workspace, window, cx| {
-                    let has_configs = workspace
-                        .project()
-                        .read(cx)
-                        .worktrees(cx)
-                        .any(|wt| !find_configs_in_snapshot(wt.read(cx)).is_empty());
-                    if has_configs {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let has_configs = workspace
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .any(|wt| !find_configs_in_snapshot(wt.read(cx)).is_empty());
+                if has_configs {
+                    // Defer to next frame for test compatibility: the modal spawns
+                    // `docker --version` on a real blocking thread that can't be cancelled.
+                    // Without this deferral the blocking thread outlives the test scheduler.
+                    // TODO: Remove once dev container commands are mockable in tests.
+                    cx.on_next_frame(window, move |workspace, window, cx| {
                         open_dev_container_modal(workspace, window, cx);
-                    } else {
-                        log::warn!(
-                            "--dev-container: no devcontainer configuration found in project"
-                        );
-                    }
-                })
+                    });
+                } else {
+                    log::warn!(
+                        "--dev-container: no devcontainer configuration found in project"
+                    );
+                }
             })
-            .detach_and_log_err(cx);
-        }
+        });
+        workspace.set_dev_container_task(task);
         return;
     }
 
