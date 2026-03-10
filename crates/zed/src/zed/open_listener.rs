@@ -752,8 +752,7 @@ pub(crate) async fn dispatch_dev_container_action(
                 }
 
                 let fs = workspace.project().read(cx).fs().clone();
-                let configs =
-                    dev_container::find_devcontainer_configs(workspace, cx);
+                let configs = dev_container::find_devcontainer_configs(workspace, cx);
                 let app_state = workspace.app_state().clone();
                 let dev_container_context =
                     dev_container::DevContainerContext::from_workspace(workspace, cx);
@@ -816,6 +815,7 @@ mod tests {
     use futures::poll;
     use gpui::{AppContext as _, TestAppContext};
     use language::LineEnding;
+    use recent_projects::RemoteServerProjects;
     use remote::SshConnectionOptions;
     use rope::Rope;
     use serde_json::json;
@@ -1164,6 +1164,7 @@ mod tests {
                         wait: true,
                         ..Default::default()
                     },
+                    false,
                     &response_tx,
                     &app_state,
                     &mut cx,
@@ -1262,6 +1263,7 @@ mod tests {
                         open_new_workspace,
                         ..Default::default()
                     },
+                    false,
                     &response_tx,
                     &app_state,
                     &mut cx,
@@ -1333,6 +1335,7 @@ mod tests {
                         vec![],
                         false,
                         workspace::OpenOptions::default(),
+                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1369,6 +1372,7 @@ mod tests {
                             replace_window: Some(window_to_replace),
                             ..Default::default()
                         },
+                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1517,6 +1521,7 @@ mod tests {
                         Vec::new(),
                         false,
                         workspace::OpenOptions::default(),
+                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1544,6 +1549,7 @@ mod tests {
                             open_new_workspace: Some(true), // Force new window
                             ..Default::default()
                         },
+                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1590,6 +1596,7 @@ mod tests {
                             open_new_workspace: Some(false), // --add flag
                             ..Default::default()
                         },
+                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1616,6 +1623,72 @@ mod tests {
             .update(cx, |workspace, _, cx| {
                 let items = workspace.workspace().read(cx).items(cx).collect::<Vec<_>>();
                 assert_eq!(items.len(), 1, "Other window should still have 1 item");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_dev_container_flag_opens_modal(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| recent_projects::init(cx));
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    ".devcontainer": {
+                        "devcontainer.json": "{}"
+                    },
+                    "src": {
+                        "main.rs": "fn main() {}"
+                    }
+                }),
+            )
+            .await;
+
+        let (response_tx, _) = ipc::channel::<CliResponse>().unwrap();
+        let errored = cx
+            .spawn({
+                let app_state = app_state.clone();
+                |mut cx| async move {
+                    open_local_workspace(
+                        vec![path!("/project").to_owned()],
+                        vec![],
+                        false,
+                        workspace::OpenOptions::default(),
+                        true,
+                        &response_tx,
+                        &app_state,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(!errored);
+
+        cx.run_until_parked();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                let modal = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_modal::<RemoteServerProjects>(cx);
+                assert!(
+                    modal.is_some(),
+                    "Dev container modal should be open after --dev-container flag"
+                );
+
+                let initiated = modal.unwrap().read(cx).dev_container_initiated();
+                assert!(
+                    initiated,
+                    "Dev container creation should be initiated (dev_container_context was None)"
+                );
             })
             .unwrap();
     }

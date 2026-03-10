@@ -67,6 +67,7 @@ pub struct RemoteServerProjects {
     ssh_config_servers: BTreeSet<SharedString>,
     create_new_window: bool,
     dev_container_picker: Option<Entity<Picker<DevContainerPickerDelegate>>>,
+    dev_container_initiated: bool,
     _subscription: Subscription,
 }
 
@@ -914,6 +915,7 @@ impl RemoteServerProjects {
             ssh_config_servers: BTreeSet::new(),
             create_new_window,
             dev_container_picker: None,
+            dev_container_initiated: false,
             _subscription,
         }
     }
@@ -1839,13 +1841,14 @@ impl RemoteServerProjects {
     }
 
     fn open_dev_container(
-        &self,
+        &mut self,
         config: Option<DevContainerConfig>,
         app_state: Arc<AppState>,
         context: DevContainerContext,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dev_container_initiated = true;
         let replace_window = window.window_handle().downcast::<MultiWorkspace>();
 
         let app_state = Arc::downgrade(&app_state);
@@ -2925,6 +2928,13 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
 
 fn get_text(element: &Entity<Editor>, cx: &mut App) -> String {
     element.read(cx).text(cx).trim().to_string()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RemoteServerProjects {
+    pub fn dev_container_initiated(&self) -> bool {
+        self.dev_container_initiated
+    }
 }
 
 impl ModalView for RemoteServerProjects {}
