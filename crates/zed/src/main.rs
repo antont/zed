@@ -60,7 +60,7 @@ use workspace::{
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
-    derive_paths_with_position, dispatch_dev_container_action, edit_prediction_registry,
+    derive_paths_with_position, edit_prediction_registry,
     handle_cli_connection, handle_keymap_file_changes, handle_settings_file_changes,
     initialize_workspace, open_paths_with_positions,
 };
@@ -1207,18 +1207,18 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         task = Some(cx.spawn(async move |cx| {
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-            let (window, results) = open_paths_with_positions(
+            let (_window, results) = open_paths_with_positions(
                 &paths_with_position,
                 &request.diff_paths,
                 request.diff_all,
                 app_state,
-                workspace::OpenOptions::default(),
+                workspace::OpenOptions {
+                    open_in_dev_container: dev_container,
+                    ..Default::default()
+                },
                 cx,
             )
             .await?;
-            if dev_container {
-                dispatch_dev_container_action(window, cx).await;
-            }
             for result in results.into_iter().flatten() {
                 if let Err(err) = result {
                     log::error!("Error opening path: {err}",);

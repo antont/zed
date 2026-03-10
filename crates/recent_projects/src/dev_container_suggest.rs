@@ -1,5 +1,6 @@
+use crate::RemoteServerProjects;
 use db::kvp::KEY_VALUE_STORE;
-use dev_container::find_configs_in_snapshot;
+use dev_container::{DevContainerContext, find_configs_in_snapshot, find_devcontainer_configs};
 use gpui::{SharedString, Window};
 use project::{Project, WorktreeId};
 use std::sync::LazyLock;
@@ -29,6 +30,7 @@ fn project_devcontainer_key(project_path: &str) -> String {
 }
 
 pub fn suggest_on_worktree_updated(
+    workspace: &mut Workspace,
     worktree_id: WorktreeId,
     updated_entries: &UpdatedEntriesSet,
     project: &gpui::Entity<Project>,
@@ -54,6 +56,33 @@ pub fn suggest_on_worktree_updated(
     }
 
     if find_configs_in_snapshot(worktree).is_empty() {
+        return;
+    }
+
+    if workspace.open_in_dev_container() {
+        workspace.set_open_in_dev_container(false);
+        cx.on_next_frame(window, move |workspace, window, cx| {
+            if !workspace.project().read(cx).is_local() {
+                return;
+            }
+
+            let fs = workspace.project().read(cx).fs().clone();
+            let configs = find_devcontainer_configs(workspace, cx);
+            let app_state = workspace.app_state().clone();
+            let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
+            let handle = cx.entity().downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RemoteServerProjects::new_dev_container(
+                    fs,
+                    configs,
+                    app_state,
+                    dev_container_context,
+                    window,
+                    handle,
+                    cx,
+                )
+            });
+        });
         return;
     }
 

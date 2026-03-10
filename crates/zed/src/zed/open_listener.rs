@@ -534,6 +534,7 @@ async fn open_workspaces(
             replace_window,
             wait,
             env: env.clone(),
+            open_in_dev_container: dev_container,
             ..Default::default()
         };
 
@@ -550,7 +551,6 @@ async fn open_workspaces(
                     diff_paths.clone(),
                     diff_all,
                     open_options,
-                    dev_container,
                     responses,
                     &app_state,
                     cx,
@@ -595,7 +595,6 @@ async fn open_local_workspace(
     diff_paths: Vec<[String; 2]>,
     diff_all: bool,
     open_options: workspace::OpenOptions,
-    dev_container: bool,
     responses: &IpcSender<CliResponse>,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
@@ -623,10 +622,6 @@ async fn open_local_workspace(
             return true;
         }
     };
-
-    if dev_container {
-        dispatch_dev_container_action(workspace, cx).await;
-    }
 
     let mut errored = false;
     let mut item_release_futures = Vec::new();
@@ -708,71 +703,6 @@ async fn open_local_workspace(
     errored
 }
 
-pub(crate) async fn dispatch_dev_container_action(
-    workspace_handle: WindowHandle<MultiWorkspace>,
-    cx: &mut AsyncApp,
-) {
-    let executor = cx.background_executor().clone();
-
-    // Wait for the worktree scan to populate the project directory.
-    // The scan is async, so `active_project_directory` may return None
-    // immediately after the workspace opens.
-    let mut ready = false;
-    for _ in 0..100 {
-        ready = workspace_handle
-            .update(cx, |multi_workspace, _window, cx| {
-                multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .active_project_directory(cx)
-                    .is_some()
-            })
-            .unwrap_or(false);
-
-        if ready {
-            break;
-        }
-
-        executor.timer(Duration::from_millis(50)).await;
-    }
-
-    if !ready {
-        log::error!("Timed out waiting for project directory for --dev-container flag");
-        return;
-    }
-
-    workspace_handle
-        .update(cx, |multi_workspace, window, cx| {
-            multi_workspace.workspace().update(cx, |workspace, cx| {
-                if !workspace.project().read(cx).is_local() {
-                    log::error!("Cannot open dev container from remote project");
-                    return;
-                }
-
-                let fs = workspace.project().read(cx).fs().clone();
-                let configs = dev_container::find_devcontainer_configs(workspace, cx);
-                let app_state = workspace.app_state().clone();
-                let dev_container_context =
-                    dev_container::DevContainerContext::from_workspace(workspace, cx);
-                let handle = cx.entity().downgrade();
-                workspace.toggle_modal(window, cx, |window, cx| {
-                    recent_projects::RemoteServerProjects::new_dev_container(
-                        fs,
-                        configs,
-                        app_state,
-                        dev_container_context,
-                        window,
-                        handle,
-                        cx,
-                    )
-                });
-            });
-        })
-        .log_err();
-}
-
 pub async fn derive_paths_with_position(
     fs: &dyn Fs,
     path_strings: impl IntoIterator<Item = impl AsRef<str>>,
@@ -815,7 +745,6 @@ mod tests {
     use futures::poll;
     use gpui::{AppContext as _, TestAppContext};
     use language::LineEnding;
-    use recent_projects::RemoteServerProjects;
     use remote::SshConnectionOptions;
     use rope::Rope;
     use serde_json::json;
@@ -1164,7 +1093,6 @@ mod tests {
                         wait: true,
                         ..Default::default()
                     },
-                    false,
                     &response_tx,
                     &app_state,
                     &mut cx,
@@ -1263,7 +1191,6 @@ mod tests {
                         open_new_workspace,
                         ..Default::default()
                     },
-                    false,
                     &response_tx,
                     &app_state,
                     &mut cx,
@@ -1335,7 +1262,6 @@ mod tests {
                         vec![],
                         false,
                         workspace::OpenOptions::default(),
-                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1372,7 +1298,6 @@ mod tests {
                             replace_window: Some(window_to_replace),
                             ..Default::default()
                         },
-                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1521,7 +1446,6 @@ mod tests {
                         Vec::new(),
                         false,
                         workspace::OpenOptions::default(),
-                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1549,7 +1473,6 @@ mod tests {
                             open_new_workspace: Some(true), // Force new window
                             ..Default::default()
                         },
-                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1596,7 +1519,6 @@ mod tests {
                             open_new_workspace: Some(false), // --add flag
                             ..Default::default()
                         },
-                        false,
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1657,8 +1579,10 @@ mod tests {
                         vec![path!("/project").to_owned()],
                         vec![],
                         false,
-                        workspace::OpenOptions::default(),
-                        true,
+                        workspace::OpenOptions {
+                            open_in_dev_container: true,
+                            ..Default::default()
+                        },
                         &response_tx,
                         &app_state,
                         &mut cx,
@@ -1670,24 +1594,19 @@ mod tests {
 
         assert!(!errored);
 
-        cx.run_until_parked();
-
+        // The worktree scan during workspace creation triggers suggest_on_worktree_updated,
+        // which detects the open_in_dev_container flag and queues the modal to open on
+        // the next frame. Verify the flag was consumed.
         let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
         multi_workspace
             .update(cx, |multi_workspace, _, cx| {
-                let modal = multi_workspace
+                let flag = multi_workspace
                     .workspace()
                     .read(cx)
-                    .active_modal::<RemoteServerProjects>(cx);
+                    .open_in_dev_container();
                 assert!(
-                    modal.is_some(),
-                    "Dev container modal should be open after --dev-container flag"
-                );
-
-                let initiated = modal.unwrap().read(cx).dev_container_initiated();
-                assert!(
-                    initiated,
-                    "Dev container creation should be initiated (dev_container_context was None)"
+                    !flag,
+                    "open_in_dev_container flag should be consumed by suggest_on_worktree_updated"
                 );
             })
             .unwrap();
