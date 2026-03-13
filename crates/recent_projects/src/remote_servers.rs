@@ -53,7 +53,7 @@ use util::{
     rel_path::RelPath,
 };
 use workspace::{
-    AppState, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
+    AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
     notifications::{DetachAndPromptErr, NotificationId},
     open_remote_project_with_existing_connection,
 };
@@ -2929,7 +2929,20 @@ fn get_text(element: &Entity<Editor>, cx: &mut App) -> String {
     element.read(cx).text(cx).trim().to_string()
 }
 
-impl ModalView for RemoteServerProjects {}
+impl ModalView for RemoteServerProjects {
+    fn on_before_dismiss(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> DismissDecision {
+        let is_creating = matches!(
+            &self.mode,
+            Mode::CreateRemoteDevContainer(state)
+                if matches!(state.progress, DevContainerCreationProgress::Creating)
+        );
+        DismissDecision::Dismiss(!is_creating)
+    }
+}
 
 impl Focusable for RemoteServerProjects {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
