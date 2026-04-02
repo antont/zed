@@ -1602,10 +1602,7 @@ mod tests {
         let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
         multi_workspace
             .update(cx, |multi_workspace, _, cx| {
-                let flag = multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .open_in_dev_container();
+                let flag = multi_workspace.workspace().read(cx).open_in_dev_container();
                 assert!(
                     !flag,
                     "open_in_dev_container flag should be consumed by suggest_on_worktree_updated"

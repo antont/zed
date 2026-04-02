@@ -62,10 +62,8 @@ pub fn suggest_on_worktree_updated(
     if cli_auto_open {
         workspace.set_open_in_dev_container(false);
         let task = cx.spawn_in(window, async move |workspace, cx| {
-            let scans_complete = workspace
-                .update(cx, |workspace, cx| {
-                    workspace.worktree_scans_complete(cx)
-                })?;
+            let scans_complete =
+                workspace.update(cx, |workspace, cx| workspace.worktree_scans_complete(cx))?;
             scans_complete.await;
 
             workspace.update_in(cx, |workspace, window, cx| {
@@ -79,9 +77,7 @@ pub fn suggest_on_worktree_updated(
                         window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
                     });
                 } else {
-                    log::warn!(
-                        "--dev-container: no devcontainer configuration found in project"
-                    );
+                    log::warn!("--dev-container: no devcontainer configuration found in project");
                 }
             })
         });
