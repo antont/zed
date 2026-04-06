@@ -1,8 +1,9 @@
 use ai_onboarding::YoungAccountBanner;
 use anthropic::AnthropicModelMode;
 use anyhow::{Context as _, Result, anyhow};
-use chrono::{DateTime, Utc};
-use client::{Client, UserStore, zed_urls};
+use client::{
+    Client, NeedsLlmTokenRefresh, RefreshLlmTokenListener, UserStore, global_llm_token, zed_urls,
+};
 use cloud_api_types::{OrganizationId, Plan};
 use cloud_llm_client::{
     CLIENT_SUPPORTS_STATUS_MESSAGES_HEADER_NAME, CLIENT_SUPPORTS_STATUS_STREAM_ENDED_HEADER_NAME,
@@ -20,12 +21,14 @@ use gpui::{AnyElement, AnyView, App, AsyncApp, Context, Entity, Subscription, Ta
 use http_client::http::{HeaderMap, HeaderValue};
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, Method, Response, StatusCode};
 use language_model::{
-    AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCacheConfiguration,
+    ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, AuthenticateError, GOOGLE_PROVIDER_ID,
+    GOOGLE_PROVIDER_NAME, IconOrSvg, LanguageModel, LanguageModelCacheConfiguration,
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolSchemaFormat, LlmApiToken, NeedsLlmTokenRefresh,
-    PaymentRequiredError, RateLimiter, RefreshLlmTokenListener,
+    LanguageModelToolChoice, LanguageModelToolSchemaFormat, LlmApiToken, OPEN_AI_PROVIDER_ID,
+    OPEN_AI_PROVIDER_NAME, PaymentRequiredError, RateLimiter, X_AI_PROVIDER_ID, X_AI_PROVIDER_NAME,
+    ZED_CLOUD_PROVIDER_ID, ZED_CLOUD_PROVIDER_NAME,
 };
 use release_channel::AppVersion;
 use schemars::JsonSchema;
@@ -54,8 +57,8 @@ use crate::provider::open_ai::{
 };
 use crate::provider::x_ai::count_xai_tokens;
 
-const PROVIDER_ID: LanguageModelProviderId = language_model::ZED_CLOUD_PROVIDER_ID;
-const PROVIDER_NAME: LanguageModelProviderName = language_model::ZED_CLOUD_PROVIDER_NAME;
+const PROVIDER_ID: LanguageModelProviderId = ZED_CLOUD_PROVIDER_ID;
+const PROVIDER_NAME: LanguageModelProviderName = ZED_CLOUD_PROVIDER_NAME;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ZedDotDevSettings {
@@ -109,7 +112,7 @@ impl State {
         cx: &mut Context<Self>,
     ) -> Self {
         let refresh_llm_token_listener = RefreshLlmTokenListener::global(cx);
-        let llm_api_token = LlmApiToken::global(cx);
+        let llm_api_token = global_llm_token(cx);
         Self {
             client: client.clone(),
             llm_api_token,
@@ -224,7 +227,9 @@ impl State {
         organization_id: Option<OrganizationId>,
     ) -> Result<ListModelsResponse> {
         let http_client = &client.http_client();
-        let token = llm_api_token.acquire(&client, organization_id).await?;
+        let token = client
+            .acquire_llm_token(&llm_api_token, organization_id)
+            .await?;
 
         let request = http_client::Request::builder()
             .method(Method::GET)
@@ -412,8 +417,8 @@ impl CloudLanguageModel {
     ) -> Result<PerformLlmCompletionResponse> {
         let http_client = &client.http_client();
 
-        let mut token = llm_api_token
-            .acquire(&client, organization_id.clone())
+        let mut token = client
+            .acquire_llm_token(&llm_api_token, organization_id.clone())
             .await?;
         let mut refreshed_token = false;
 
@@ -445,8 +450,8 @@ impl CloudLanguageModel {
             }
 
             if !refreshed_token && response.needs_llm_token_refresh() {
-                token = llm_api_token
-                    .refresh(&client, organization_id.clone())
+                token = client
+                    .refresh_llm_token(&llm_api_token, organization_id.clone())
                     .await?;
                 refreshed_token = true;
                 continue;
@@ -569,20 +574,20 @@ impl LanguageModel for CloudLanguageModel {
     fn upstream_provider_id(&self) -> LanguageModelProviderId {
         use cloud_llm_client::LanguageModelProvider::*;
         match self.model.provider {
-            Anthropic => language_model::ANTHROPIC_PROVIDER_ID,
-            OpenAi => language_model::OPEN_AI_PROVIDER_ID,
-            Google => language_model::GOOGLE_PROVIDER_ID,
-            XAi => language_model::X_AI_PROVIDER_ID,
+            Anthropic => ANTHROPIC_PROVIDER_ID,
+            OpenAi => OPEN_AI_PROVIDER_ID,
+            Google => GOOGLE_PROVIDER_ID,
+            XAi => X_AI_PROVIDER_ID,
         }
     }
 
     fn upstream_provider_name(&self) -> LanguageModelProviderName {
         use cloud_llm_client::LanguageModelProvider::*;
         match self.model.provider {
-            Anthropic => language_model::ANTHROPIC_PROVIDER_NAME,
-            OpenAi => language_model::OPEN_AI_PROVIDER_NAME,
-            Google => language_model::GOOGLE_PROVIDER_NAME,
-            XAi => language_model::X_AI_PROVIDER_NAME,
+            Anthropic => ANTHROPIC_PROVIDER_NAME,
+            OpenAi => OPEN_AI_PROVIDER_NAME,
+            Google => GOOGLE_PROVIDER_NAME,
+            XAi => X_AI_PROVIDER_NAME,
         }
     }
 
@@ -632,7 +637,7 @@ impl LanguageModel for CloudLanguageModel {
 
     fn supports_split_token_display(&self) -> bool {
         use cloud_llm_client::LanguageModelProvider::*;
-        matches!(self.model.provider, OpenAi)
+        matches!(self.model.provider, OpenAi | XAi)
     }
 
     fn telemetry_id(&self) -> String {
@@ -642,11 +647,11 @@ impl LanguageModel for CloudLanguageModel {
     fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
         match self.model.provider {
             cloud_llm_client::LanguageModelProvider::Anthropic
-            | cloud_llm_client::LanguageModelProvider::OpenAi
-            | cloud_llm_client::LanguageModelProvider::XAi => {
+            | cloud_llm_client::LanguageModelProvider::OpenAi => {
                 LanguageModelToolSchemaFormat::JsonSchema
             }
-            cloud_llm_client::LanguageModelProvider::Google => {
+            cloud_llm_client::LanguageModelProvider::Google
+            | cloud_llm_client::LanguageModelProvider::XAi => {
                 LanguageModelToolSchemaFormat::JsonSchemaSubset
             }
         }
@@ -711,7 +716,9 @@ impl LanguageModel for CloudLanguageModel {
                     into_google(request, model_id.clone(), GoogleModelMode::Default);
                 async move {
                     let http_client = &client.http_client();
-                    let token = llm_api_token.acquire(&client, organization_id).await?;
+                    let token = client
+                        .acquire_llm_token(&llm_api_token, organization_id)
+                        .await?;
 
                     let request_body = CountTokensBody {
                         provider: cloud_llm_client::LanguageModelProvider::Google,
@@ -770,7 +777,6 @@ impl LanguageModel for CloudLanguageModel {
     > {
         let thread_id = request.thread_id.clone();
         let prompt_id = request.prompt_id.clone();
-        let intent = request.intent;
         let app_version = Some(cx.update(|cx| AppVersion::global(cx)));
         let user_store = self.user_store.clone();
         let organization_id = cx.update(|cx| {
@@ -823,7 +829,6 @@ impl LanguageModel for CloudLanguageModel {
                         CompletionBody {
                             thread_id,
                             prompt_id,
-                            intent,
                             provider: cloud_llm_client::LanguageModelProvider::Anthropic,
                             model: request.model.clone(),
                             provider_request: serde_json::to_value(&request)
@@ -882,7 +887,6 @@ impl LanguageModel for CloudLanguageModel {
                         CompletionBody {
                             thread_id,
                             prompt_id,
-                            intent,
                             provider: cloud_llm_client::LanguageModelProvider::OpenAi,
                             model: request.model.clone(),
                             provider_request: serde_json::to_value(&request)
@@ -924,7 +928,6 @@ impl LanguageModel for CloudLanguageModel {
                         CompletionBody {
                             thread_id,
                             prompt_id,
-                            intent,
                             provider: cloud_llm_client::LanguageModelProvider::XAi,
                             model: request.model.clone(),
                             provider_request: serde_json::to_value(&request)
@@ -959,7 +962,6 @@ impl LanguageModel for CloudLanguageModel {
                         CompletionBody {
                             thread_id,
                             prompt_id,
-                            intent,
                             provider: cloud_llm_client::LanguageModelProvider::Google,
                             model: request.model.model_id.clone(),
                             provider_request: serde_json::to_value(&request)
@@ -1053,12 +1055,10 @@ where
 
 fn provider_name(provider: &cloud_llm_client::LanguageModelProvider) -> LanguageModelProviderName {
     match provider {
-        cloud_llm_client::LanguageModelProvider::Anthropic => {
-            language_model::ANTHROPIC_PROVIDER_NAME
-        }
-        cloud_llm_client::LanguageModelProvider::OpenAi => language_model::OPEN_AI_PROVIDER_NAME,
-        cloud_llm_client::LanguageModelProvider::Google => language_model::GOOGLE_PROVIDER_NAME,
-        cloud_llm_client::LanguageModelProvider::XAi => language_model::X_AI_PROVIDER_NAME,
+        cloud_llm_client::LanguageModelProvider::Anthropic => ANTHROPIC_PROVIDER_NAME,
+        cloud_llm_client::LanguageModelProvider::OpenAi => OPEN_AI_PROVIDER_NAME,
+        cloud_llm_client::LanguageModelProvider::Google => GOOGLE_PROVIDER_NAME,
+        cloud_llm_client::LanguageModelProvider::XAi => X_AI_PROVIDER_NAME,
     }
 }
 
@@ -1091,7 +1091,6 @@ fn response_lines<T: DeserializeOwned>(
 struct ZedAiConfiguration {
     is_connected: bool,
     plan: Option<Plan>,
-    subscription_period: Option<(DateTime<Utc>, DateTime<Utc>)>,
     eligible_for_trial: bool,
     account_too_young: bool,
     sign_in_callback: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
@@ -1099,33 +1098,37 @@ struct ZedAiConfiguration {
 
 impl RenderOnce for ZedAiConfiguration {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let is_pro = self.plan.is_some_and(|plan| plan == Plan::ZedPro);
-        let subscription_text = match (self.plan, self.subscription_period) {
-            (Some(Plan::ZedPro), Some(_)) => {
-                "You have access to Zed's hosted models through your Pro subscription."
-            }
-            (Some(Plan::ZedProTrial), Some(_)) => {
-                "You have access to Zed's hosted models through your Pro trial."
-            }
-            (Some(Plan::ZedFree), Some(_)) => {
+        let (subscription_text, has_paid_plan) = match self.plan {
+            Some(Plan::ZedPro) => (
+                "You have access to Zed's hosted models through your Pro subscription.",
+                true,
+            ),
+            Some(Plan::ZedProTrial) => (
+                "You have access to Zed's hosted models through your Pro trial.",
+                false,
+            ),
+            Some(Plan::ZedStudent) => (
+                "You have access to Zed's hosted models through your Student subscription.",
+                true,
+            ),
+            Some(Plan::ZedBusiness) => (
+                "You have access to Zed's hosted models through your Organization.",
+                true,
+            ),
+            Some(Plan::ZedFree) | None => (
                 if self.eligible_for_trial {
                     "Subscribe for access to Zed's hosted models. Start with a 14 day free trial."
                 } else {
                     "Subscribe for access to Zed's hosted models."
-                }
-            }
-            _ => {
-                if self.eligible_for_trial {
-                    "Subscribe for access to Zed's hosted models. Start with a 14 day free trial."
-                } else {
-                    "Subscribe for access to Zed's hosted models."
-                }
-            }
+                },
+                false,
+            ),
         };
 
-        let manage_subscription_buttons = if is_pro {
+        let manage_subscription_buttons = if has_paid_plan {
             Button::new("manage_settings", "Manage Subscription")
                 .full_width()
+                .label_size(LabelSize::Small)
                 .style(ButtonStyle::Tinted(TintColor::Accent))
                 .on_click(|_, _, cx| cx.open_url(&zed_urls::account_url(cx)))
                 .into_any_element()
@@ -1149,10 +1152,7 @@ impl RenderOnce for ZedAiConfiguration {
                 .child(Label::new("Sign in to have access to Zed's complete agentic experience with hosted models."))
                 .child(
                     Button::new("sign_in", "Sign In to use Zed AI")
-                        .icon_color(Color::Muted)
-                        .icon(IconName::Github)
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
+                        .start_icon(Icon::new(IconName::Github).size(IconSize::Small).color(Color::Muted))
                         .full_width()
                         .on_click({
                             let callback = self.sign_in_callback.clone();
@@ -1209,7 +1209,6 @@ impl Render for ConfigurationView {
         ZedAiConfiguration {
             is_connected: !state.is_signed_out(cx),
             plan: user_store.plan(),
-            subscription_period: user_store.subscription_period(),
             eligible_for_trial: user_store.trial_started_at().is_none(),
             account_too_young: user_store.account_too_young(),
             sign_in_callback: self.sign_in_callback.clone(),
@@ -1240,9 +1239,6 @@ impl Component for ZedAiConfiguration {
             ZedAiConfiguration {
                 is_connected,
                 plan,
-                subscription_period: plan
-                    .is_some()
-                    .then(|| (Utc::now(), Utc::now() + chrono::Duration::days(7))),
                 eligible_for_trial,
                 account_too_young,
                 sign_in_callback: Arc::new(|_, _| {}),
