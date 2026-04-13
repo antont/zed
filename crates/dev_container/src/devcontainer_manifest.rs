@@ -3675,6 +3675,40 @@ ENV DOCKER_BUILDKIT=1
     }
 
     #[gpui::test]
+    async fn test_docker_compose_dockerfile_resolved_relative_to_context(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        env_logger::try_init().ok();
+
+        let given_devcontainer_contents = r#"
+            {
+              "name": "Test",
+              "dockerComposeFile": "docker-compose-context-parent.yml",
+              "service": "app",
+              "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
+            }
+            "#;
+        let (_, mut devcontainer_manifest) =
+            init_default_devcontainer_manifest(cx, given_devcontainer_contents)
+                .await
+                .unwrap();
+
+        devcontainer_manifest.parse_nonremote_vars().unwrap();
+
+        let dockerfile_location = devcontainer_manifest.dockerfile_location().await;
+        let expected_path =
+            PathBuf::from(TEST_PROJECT_PATH).join(".devcontainer/Dockerfile");
+        assert_eq!(
+            dockerfile_location,
+            Some(expected_path),
+            "dockerfile should be resolved relative to build context (../.devcontainer/Dockerfile \
+             = <project>/.devcontainer/Dockerfile), not relative to compose file directory \
+             which would produce <project>/.devcontainer/.devcontainer/Dockerfile"
+        );
+    }
+
+    #[gpui::test]
     async fn test_spawns_devcontainer_with_docker_compose_and_no_update_uid(
         cx: &mut TestAppContext,
     ) {
@@ -4929,6 +4963,30 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                         "postgres-data".to_string(),
                         DockerComposeVolume::default(),
                     )]),
+                }));
+            }
+            if config_files.len() == 1
+                && config_files.get(0)
+                    == Some(&PathBuf::from(
+                        "/path/to/local/project/.devcontainer/docker-compose-context-parent.yml",
+                    ))
+            {
+                return Ok(Some(DockerComposeConfig {
+                    name: None,
+                    services: HashMap::from([(
+                        "app".to_string(),
+                        DockerComposeService {
+                            build: Some(DockerComposeServiceBuild {
+                                context: Some("..".to_string()),
+                                dockerfile: Some(".devcontainer/Dockerfile".to_string()),
+                                args: None,
+                                additional_contexts: None,
+                                target: None,
+                            }),
+                            ..Default::default()
+                        },
+                    )]),
+                    volumes: HashMap::new(),
                 }));
             }
             if config_files.len() == 1
