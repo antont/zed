@@ -10,7 +10,7 @@ use regex::Regex;
 
 use fs::Fs;
 use http_client::HttpClient;
-use util::{ResultExt, command::Command};
+use util::{ResultExt, command::Command, normalize_path};
 
 use crate::{
     DevContainerConfig, DevContainerContext,
@@ -231,10 +231,14 @@ impl DevContainerManifest {
                 else {
                     return None;
                 };
-                main_service
-                    .build
-                    .and_then(|b| b.dockerfile)
-                    .map(|dockerfile| self.config_directory.join(dockerfile))
+                main_service.build.and_then(|b| {
+                    let compose_file = docker_compose_manifest.files.first()?;
+                    resolve_compose_dockerfile(
+                        compose_file,
+                        b.context.as_deref(),
+                        b.dockerfile.as_deref()?,
+                    )
+                })
             }
             DevContainerBuildType::None => None,
         }
@@ -2164,6 +2168,33 @@ fn find_primary_service(
     }
 }
 
+/// Resolves a compose service's dockerfile path according to the Docker Compose spec:
+/// `dockerfile` is relative to the build `context`, and `context` is relative to
+/// the compose file's directory.
+fn resolve_compose_dockerfile(
+    compose_file: &Path,
+    context: Option<&str>,
+    dockerfile: &str,
+) -> Option<PathBuf> {
+    let dockerfile = PathBuf::from(dockerfile);
+    if dockerfile.is_absolute() {
+        return Some(dockerfile);
+    }
+    let compose_dir = compose_file.parent()?;
+    let context_dir = match context {
+        Some(ctx) => {
+            let ctx = PathBuf::from(ctx);
+            if ctx.is_absolute() {
+                ctx
+            } else {
+                normalize_path(&compose_dir.join(ctx))
+            }
+        }
+        None => compose_dir.to_path_buf(),
+    };
+    Some(context_dir.join(dockerfile))
+}
+
 /// Destination folder inside the container where feature content is staged during build.
 /// Mirrors the CLI's `FEATURES_CONTAINER_TEMP_DEST_FOLDER`.
 const FEATURES_CONTAINER_TEMP_DEST_FOLDER: &str = "/tmp/dev-container-features";
@@ -2405,7 +2436,7 @@ mod test {
     use std::{
         collections::HashMap,
         ffi::OsStr,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{ExitStatus, Output},
         sync::{Arc, Mutex},
     };
@@ -2431,7 +2462,7 @@ mod test {
         devcontainer_manifest::{
             ConfigStatus, DevContainerManifest, DockerBuildResources, DockerComposeResources,
             DockerInspect, extract_feature_id, find_primary_service, get_remote_user_from_config,
-            image_from_dockerfile,
+            image_from_dockerfile, resolve_compose_dockerfile,
         },
         docker::{
             DockerClient, DockerComposeConfig, DockerComposeService, DockerComposeServiceBuild,
@@ -3674,10 +3705,47 @@ ENV DOCKER_BUILDKIT=1
         )
     }
 
+    #[test]
+    fn test_resolve_compose_dockerfile() {
+        let compose = Path::new("/project/.devcontainer/docker-compose.yml");
+
+        // Bug case (#53473): context ".." with relative dockerfile
+        assert_eq!(
+            resolve_compose_dockerfile(compose, Some(".."), ".devcontainer/Dockerfile"),
+            Some(PathBuf::from("/project/.devcontainer/Dockerfile")),
+        );
+
+        // Compose path containing ".." (as docker_compose_manifest() produces)
+        assert_eq!(
+            resolve_compose_dockerfile(
+                Path::new("/project/.devcontainer/../docker-compose.yml"),
+                Some("."),
+                "docker/Dockerfile",
+            ),
+            Some(PathBuf::from("/project/docker/Dockerfile")),
+        );
+
+        // Absolute dockerfile returned as-is
+        assert_eq!(
+            resolve_compose_dockerfile(compose, Some("."), "/absolute/Dockerfile"),
+            Some(PathBuf::from("/absolute/Dockerfile")),
+        );
+
+        // Absolute context used directly
+        assert_eq!(
+            resolve_compose_dockerfile(compose, Some("/abs/context"), "Dockerfile"),
+            Some(PathBuf::from("/abs/context/Dockerfile")),
+        );
+
+        // No context defaults to compose file's directory
+        assert_eq!(
+            resolve_compose_dockerfile(compose, None, "Dockerfile"),
+            Some(PathBuf::from("/project/.devcontainer/Dockerfile")),
+        );
+    }
+
     #[gpui::test]
-    async fn test_docker_compose_dockerfile_resolved_relative_to_context(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_dockerfile_location_with_compose_context_parent(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         env_logger::try_init().ok();
 
@@ -3696,16 +3764,8 @@ ENV DOCKER_BUILDKIT=1
 
         devcontainer_manifest.parse_nonremote_vars().unwrap();
 
-        let dockerfile_location = devcontainer_manifest.dockerfile_location().await;
-        let expected_path =
-            PathBuf::from(TEST_PROJECT_PATH).join(".devcontainer/Dockerfile");
-        assert_eq!(
-            dockerfile_location,
-            Some(expected_path),
-            "dockerfile should be resolved relative to build context (../.devcontainer/Dockerfile \
-             = <project>/.devcontainer/Dockerfile), not relative to compose file directory \
-             which would produce <project>/.devcontainer/.devcontainer/Dockerfile"
-        );
+        let expected = PathBuf::from(TEST_PROJECT_PATH).join(".devcontainer/Dockerfile");
+        assert_eq!(devcontainer_manifest.dockerfile_location().await, Some(expected));
     }
 
     #[gpui::test]
