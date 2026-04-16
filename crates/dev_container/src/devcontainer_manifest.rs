@@ -3765,7 +3765,10 @@ ENV DOCKER_BUILDKIT=1
         devcontainer_manifest.parse_nonremote_vars().unwrap();
 
         let expected = PathBuf::from(TEST_PROJECT_PATH).join(".devcontainer/Dockerfile");
-        assert_eq!(devcontainer_manifest.dockerfile_location().await, Some(expected));
+        assert_eq!(
+            devcontainer_manifest.dockerfile_location().await,
+            Some(expected)
+        );
     }
 
     #[gpui::test]
