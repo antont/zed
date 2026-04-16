@@ -52,13 +52,66 @@ where
         if raw.is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
             return Ok(None);
         }
-        let value = serde_json_lenient::from_str(&raw)
-            .map_err(|e| format!("Error deserializing from raw json: {e}"));
-        value
+        // Use a streaming deserializer to parse just the first JSON value. This handles
+        // commands like `docker ps --format={{ json . }}` that return newline-delimited
+        // JSON (one object per line) when multiple results match.
+        serde_json_lenient::Deserializer::from_str(&raw)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Error deserializing from raw json: no value found".to_string())?
+            .map_err(|e| format!("Error deserializing from raw json: {e}"))
     } else {
         let std_err = String::from_utf8_lossy(&output.stderr);
         Err(format!(
             "Sent non-successful output; cannot deserialize. StdErr: {std_err}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitStatus;
+
+    use super::*;
+
+    fn success_output(stdout: &str) -> Output {
+        Output {
+            status: ExitStatus::default(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestItem {
+        id: String,
+    }
+
+    #[test]
+    fn test_deserialize_single_json_object() {
+        let output = success_output(r#"{"id":"abc123"}"#);
+        let result: Option<TestItem> = deserialize_json_output(output).unwrap();
+        assert_eq!(result, Some(TestItem { id: "abc123".into() }));
+    }
+
+    #[test]
+    fn test_deserialize_newline_delimited_json() {
+        let output = success_output("{\"id\":\"first\"}\n{\"id\":\"second\"}\n{\"id\":\"third\"}\n");
+        let result: Option<TestItem> = deserialize_json_output(output).unwrap();
+        assert_eq!(result, Some(TestItem { id: "first".into() }));
+    }
+
+    #[test]
+    fn test_deserialize_empty_output() {
+        let output = success_output("");
+        let result: Option<TestItem> = deserialize_json_output(output).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_deserialize_empty_object() {
+        let output = success_output("{}");
+        let result: Option<TestItem> = deserialize_json_output(output).unwrap();
+        assert_eq!(result, None);
     }
 }
