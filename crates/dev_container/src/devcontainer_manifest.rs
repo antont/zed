@@ -3719,6 +3719,28 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 
         let _devcontainer_up = devcontainer_manifest.build_and_run().await.unwrap();
 
+        let docker_commands = test_dependencies
+            .command_runner
+            .commands_by_program("docker");
+        let compose_up = docker_commands
+            .iter()
+            .find(|c| {
+                c.args.first().map(String::as_str) == Some("compose")
+                    && c.args.iter().any(|a| a == "up")
+            })
+            .expect("docker compose up command recorded");
+        let project_name_idx = compose_up
+            .args
+            .iter()
+            .position(|a| a == "--project-name")
+            .expect("compose command has --project-name flag");
+        assert_eq!(
+            compose_up.args[project_name_idx + 1],
+            "project_devcontainer",
+            "compose project name should match @devcontainers/cli derivation \
+             (${{folderBasename}}_devcontainer), ignoring devcontainer.json `name`"
+        );
+
         let files = test_dependencies.fs.files();
         let feature_dockerfile = files
             .iter()
