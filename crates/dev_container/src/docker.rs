@@ -39,6 +39,8 @@ pub(crate) struct DockerConfigLabels {
         deserialize_with = "deserialize_metadata"
     )]
     pub(crate) metadata: Option<Vec<HashMap<String, serde_json_lenient::Value>>>,
+    #[serde(default, rename = "com.docker.compose.project")]
+    pub(crate) compose_project: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
@@ -590,7 +592,10 @@ mod test {
     #[test]
     fn should_parse_simple_env_var() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels { metadata: None },
+            labels: super::DockerConfigLabels {
+                metadata: None,
+                compose_project: None,
+            },
             image_user: None,
             env: vec!["KEY=value".to_string()],
         };
@@ -602,7 +607,10 @@ mod test {
     #[test]
     fn should_parse_env_var_with_equals_in_value() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels { metadata: None },
+            labels: super::DockerConfigLabels {
+                metadata: None,
+                compose_project: None,
+            },
             image_user: None,
             env: vec!["COMPLEX=key=val other>=1.0".to_string()],
         };
@@ -614,7 +622,10 @@ mod test {
     #[test]
     fn should_parse_database_url_with_equals_in_query_string() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels { metadata: None },
+            labels: super::DockerConfigLabels {
+                metadata: None,
+                compose_project: None,
+            },
             image_user: None,
             env: vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -633,7 +644,10 @@ mod test {
     #[test]
     fn should_skip_env_var_without_equals() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels { metadata: None },
+            labels: super::DockerConfigLabels {
+                metadata: None,
+                compose_project: None,
+            },
             image_user: None,
             env: vec![
                 "VALID_KEY=valid_value".to_string(),
