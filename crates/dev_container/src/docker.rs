@@ -1158,4 +1158,30 @@ mod test {
         let inspect: DockerInspect = serde_json_lenient::from_str(given_config).unwrap();
         assert!(inspect.config.labels.metadata.is_none());
     }
+
+    #[test]
+    fn should_deserialize_inspect_with_compose_project_label() {
+        // Guards the `com.docker.compose.project` serde rename on
+        // `DockerConfigLabels`, which the multi-match tiebreak in
+        // `check_for_existing_container` reads directly from real
+        // `docker inspect` output.
+        let given_config = r#"
+        {
+            "Id": "sha256:abc123",
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "devcontainer-compose-test_devcontainer",
+                    "devcontainer.local_folder": "/path/to/project"
+                }
+            }
+        }
+        "#;
+
+        let inspect: DockerInspect = serde_json_lenient::from_str(given_config).unwrap();
+        assert_eq!(
+            inspect.config.labels.compose_project.as_deref(),
+            Some("devcontainer-compose-test_devcontainer")
+        );
+        assert!(inspect.config.labels.metadata.is_none());
+    }
 }
