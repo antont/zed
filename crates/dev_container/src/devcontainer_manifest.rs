@@ -5118,6 +5118,26 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         assert_eq!(base_image, "test_image:latest");
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[gpui::test]
+    async fn check_for_existing_container_errors_when_multiple_match(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (test_dependencies, devcontainer_manifest) =
+            init_default_devcontainer_manifest(cx, r#"{"image": "image"}"#)
+                .await
+                .unwrap();
+        test_dependencies
+            .docker
+            .set_duplicate_container_ids(vec!["abc123".to_string(), "def456".to_string()]);
+
+        let result = devcontainer_manifest.check_for_existing_devcontainer().await;
+
+        let Err(DevContainerError::MultipleMatchingContainers(ids)) = result else {
+            panic!("expected MultipleMatchingContainers, got {result:?}");
+        };
+        assert_eq!(ids, vec!["abc123".to_string(), "def456".to_string()]);
+    }
+
     #[test]
     fn test_aliases_dockerfile_with_pre_existing_aliases_for_build() {}
 
@@ -5139,6 +5159,10 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         exec_commands_recorded: Mutex<Vec<RecordedExecCommand>>,
         podman: bool,
         has_buildx: bool,
+        /// When `Some`, `find_process_by_filters` returns
+        /// `MultipleMatchingContainers` with these IDs. Used to exercise the
+        /// duplicate-container error path.
+        duplicate_container_ids: Mutex<Option<Vec<String>>>,
     }
 
     impl FakeDocker {
@@ -5147,11 +5171,19 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                 podman: false,
                 has_buildx: true,
                 exec_commands_recorded: Mutex::new(Vec::new()),
+                duplicate_container_ids: Mutex::new(None),
             }
         }
         #[cfg(not(target_os = "windows"))]
         fn set_podman(&mut self, podman: bool) {
             self.podman = podman;
+        }
+        #[cfg(not(target_os = "windows"))]
+        fn set_duplicate_container_ids(&self, ids: Vec<String>) {
+            *self
+                .duplicate_container_ids
+                .lock()
+                .expect("should be available") = Some(ids);
         }
     }
 
@@ -5445,6 +5477,14 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
             &self,
             _filters: Vec<String>,
         ) -> Result<Option<DockerPs>, DevContainerError> {
+            if let Some(ids) = self
+                .duplicate_container_ids
+                .lock()
+                .expect("should be available")
+                .clone()
+            {
+                return Err(DevContainerError::MultipleMatchingContainers(ids));
+            }
             Ok(Some(DockerPs {
                 id: "found_docker_ps".to_string(),
             }))
