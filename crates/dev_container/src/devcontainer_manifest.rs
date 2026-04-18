@@ -2015,14 +2015,60 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     }
 
     async fn check_for_existing_container(&self) -> Result<Option<DockerPs>, DevContainerError> {
-        self.docker_client
-            .find_process_by_filters(
-                self.identifying_labels()
-                    .iter()
-                    .map(|(k, v)| format!("label={k}={v}"))
-                    .collect(),
-            )
-            .await
+        let filters = self
+            .identifying_labels()
+            .iter()
+            .map(|(k, v)| format!("label={k}={v}"))
+            .collect();
+        match self.docker_client.find_process_by_filters(filters).await {
+            Ok(v) => Ok(v),
+            Err(DevContainerError::MultipleMatchingContainers(ids)) => {
+                self.pick_canonical_container(ids).await
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Resolves a multi-match against the identifying labels by preferring
+    /// the container whose `com.docker.compose.project` label equals
+    /// `self.project_name()`. Falls through to `MultipleMatchingContainers`
+    /// when zero or ≥2 candidates claim the canonical project — users then
+    /// have to clean up the duplicate state themselves, per #54068.
+    ///
+    /// Handles the common upgrade path where a Zed install from before the
+    /// compose-project-name fix (PR #6) left behind a container under the
+    /// legacy `safe_id_lower(devcontainer.name)` project, now colliding at
+    /// the label layer with a new container under the canonical project.
+    async fn pick_canonical_container(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Option<DockerPs>, DevContainerError> {
+        let canonical_project = self.project_name();
+        let mut canonical: Option<String> = None;
+        let mut others: Vec<String> = Vec::new();
+        for id in &ids {
+            let inspect = self.docker_client.inspect(id).await?;
+            if inspect.config.labels.compose_project.as_deref() == Some(canonical_project.as_str())
+            {
+                if canonical.is_some() {
+                    return Err(DevContainerError::MultipleMatchingContainers(ids));
+                }
+                canonical = Some(id.clone());
+            } else {
+                others.push(id.clone());
+            }
+        }
+        match canonical {
+            Some(id) => {
+                log::warn!(
+                    "Multiple containers match dev container labels; reusing `{id}` under \
+                     compose project `{canonical_project}`, ignoring legacy duplicate(s): {}",
+                    others.join(", ")
+                );
+                Ok(Some(DockerPs { id }))
+            }
+            None => Err(DevContainerError::MultipleMatchingContainers(ids)),
+        }
     }
 
     fn project_name(&self) -> String {
@@ -4980,6 +5026,16 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         test_dependencies
             .docker
             .set_duplicate_container_ids(vec!["abc123".to_string(), "def456".to_string()]);
+        // Both candidates claim non-canonical compose projects, so the
+        // tiebreak introduced above falls through to the safety-net error.
+        test_dependencies.docker.add_inspect_override(
+            "abc123".to_string(),
+            docker_inspect_with_compose_project("abc123", "non_canonical_a"),
+        );
+        test_dependencies.docker.add_inspect_override(
+            "def456".to_string(),
+            docker_inspect_with_compose_project("def456", "non_canonical_b"),
+        );
 
         let result = devcontainer_manifest
             .check_for_existing_devcontainer()
