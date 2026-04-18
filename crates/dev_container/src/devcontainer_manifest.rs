@@ -2672,6 +2672,7 @@ mod test {
             config: DockerInspectConfig {
                 labels: DockerConfigLabels {
                     metadata: Some(vec![metadata]),
+                    compose_project: None,
                 },
                 image_user: None,
                 env: Vec::new(),
@@ -2700,6 +2701,7 @@ mod test {
             config: DockerInspectConfig {
                 labels: DockerConfigLabels {
                     metadata: Some(vec![metadata]),
+                    compose_project: None,
                 },
                 image_user: None,
                 env: Vec::new(),
@@ -2753,7 +2755,10 @@ mod test {
             image: DockerInspect {
                 id: "mcr.microsoft.com/devcontainers/base:ubuntu".to_string(),
                 config: DockerInspectConfig {
-                    labels: DockerConfigLabels { metadata: None },
+                    labels: DockerConfigLabels {
+                        metadata: None,
+                        compose_project: None,
+                    },
                     image_user: None,
                     env: Vec::new(),
                 },
@@ -4986,6 +4991,93 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         assert_eq!(ids, vec!["abc123".to_string(), "def456".to_string()]);
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn docker_inspect_with_compose_project(id: &str, compose_project: &str) -> DockerInspect {
+        DockerInspect {
+            id: id.to_string(),
+            config: DockerInspectConfig {
+                labels: DockerConfigLabels {
+                    metadata: None,
+                    compose_project: Some(compose_project.to_string()),
+                },
+                image_user: None,
+                env: Vec::new(),
+            },
+            mounts: None,
+            state: None,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[gpui::test]
+    async fn check_for_existing_container_prefers_canonical_compose_project(
+        cx: &mut TestAppContext,
+    ) {
+        // Upgrade scenario: a pre-existing Zed container under the legacy
+        // `safe_id_lower(name)` compose project collides at the label layer
+        // with a container under the new CLI-matching project. Labels +
+        // project-name derivation (PR #6) mean one of the candidates lives
+        // under the canonical `project_name()`; prefer that one and treat the
+        // other as an orphan to ignore.
+        cx.executor().allow_parking();
+        let (test_dependencies, devcontainer_manifest) =
+            init_default_devcontainer_manifest(cx, r#"{"name": "Rust and PostgreSQL"}"#)
+                .await
+                .unwrap();
+        test_dependencies
+            .docker
+            .set_duplicate_container_ids(vec!["canonical_id".to_string(), "legacy_id".to_string()]);
+        // `project_name()` for TEST_PROJECT_PATH (`/path/to/local/project`)
+        // resolves to `project_devcontainer` under the PR #6 derivation.
+        test_dependencies.docker.add_inspect_override(
+            "canonical_id".to_string(),
+            docker_inspect_with_compose_project("canonical_id", "project_devcontainer"),
+        );
+        test_dependencies.docker.add_inspect_override(
+            "legacy_id".to_string(),
+            docker_inspect_with_compose_project("legacy_id", "rust_and_postgresql"),
+        );
+
+        let result = devcontainer_manifest.check_for_existing_container().await;
+
+        let Ok(Some(docker_ps)) = result else {
+            panic!("expected Ok(Some(canonical)), got {result:?}");
+        };
+        assert_eq!(docker_ps.id, "canonical_id".to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[gpui::test]
+    async fn check_for_existing_container_errors_when_none_canonical(cx: &mut TestAppContext) {
+        // When none of the multi-match candidates claim the canonical compose
+        // project, fall through to the safety net from #54068 so the user
+        // must resolve the ambiguity manually — the tiebreak must not pick
+        // an arbitrary container.
+        cx.executor().allow_parking();
+        let (test_dependencies, devcontainer_manifest) =
+            init_default_devcontainer_manifest(cx, r#"{"image": "image"}"#)
+                .await
+                .unwrap();
+        test_dependencies
+            .docker
+            .set_duplicate_container_ids(vec!["foo_id".to_string(), "bar_id".to_string()]);
+        test_dependencies.docker.add_inspect_override(
+            "foo_id".to_string(),
+            docker_inspect_with_compose_project("foo_id", "foo_project"),
+        );
+        test_dependencies.docker.add_inspect_override(
+            "bar_id".to_string(),
+            docker_inspect_with_compose_project("bar_id", "bar_project"),
+        );
+
+        let result = devcontainer_manifest.check_for_existing_container().await;
+
+        let Err(DevContainerError::MultipleMatchingContainers(ids)) = result else {
+            panic!("expected MultipleMatchingContainers, got {result:?}");
+        };
+        assert_eq!(ids, vec!["foo_id".to_string(), "bar_id".to_string()]);
+    }
+
     #[test]
     fn test_aliases_dockerfile_with_pre_existing_aliases_for_build() {}
 
@@ -5011,6 +5103,10 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         /// `MultipleMatchingContainers` with these IDs. Used to exercise the
         /// duplicate-container error path.
         duplicate_container_ids: Mutex<Option<Vec<String>>>,
+        /// Per-ID inspect responses consulted before the hardcoded pattern
+        /// matches in `inspect`. Lets tests that exercise multi-match recovery
+        /// control the `com.docker.compose.project` label of each candidate.
+        inspect_overrides: Mutex<HashMap<String, DockerInspect>>,
     }
 
     impl FakeDocker {
@@ -5020,6 +5116,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                 has_buildx: true,
                 exec_commands_recorded: Mutex::new(Vec::new()),
                 duplicate_container_ids: Mutex::new(None),
+                inspect_overrides: Mutex::new(HashMap::new()),
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -5033,11 +5130,27 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                 .lock()
                 .expect("should be available") = Some(ids);
         }
+        #[cfg(not(target_os = "windows"))]
+        fn add_inspect_override(&self, id: String, inspect: DockerInspect) {
+            self.inspect_overrides
+                .lock()
+                .expect("should be available")
+                .insert(id, inspect);
+        }
     }
 
     #[async_trait]
     impl DockerClient for FakeDocker {
         async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError> {
+            if let Some(inspect) = self
+                .inspect_overrides
+                .lock()
+                .expect("should be available")
+                .get(id)
+                .cloned()
+            {
+                return Ok(inspect);
+            }
             if id == "mcr.microsoft.com/devcontainers/typescript-node:1-18-bookworm" {
                 return Ok(DockerInspect {
                     id: "sha256:610e6cfca95280188b021774f8cf69dd6f49bdb6eebc34c5ee2010f4d51cc104"
@@ -5048,6 +5161,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         env: Vec::new(),
                         image_user: Some("root".to_string()),
@@ -5066,6 +5180,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("vscode".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: Vec::new(),
@@ -5084,6 +5199,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: vec!["PATH=/initial/path".to_string()],
@@ -5102,6 +5218,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: vec!["PATH=/initial/path".to_string()],
@@ -5123,6 +5240,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("vscode".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: Vec::new(),
@@ -5141,6 +5259,7 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
+                            compose_project: None,
                         },
                         env: Vec::new(),
                         image_user: Some("root".to_string()),
