@@ -2026,14 +2026,17 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     }
 
     fn project_name(&self) -> String {
-        if let Some(name) = &self.dev_container().name {
-            safe_id_lower(name)
-        } else {
-            let alternate_name = &self
-                .local_workspace_base_name()
-                .unwrap_or(self.local_workspace_folder());
-            safe_id_lower(alternate_name)
-        }
+        // Match @devcontainers/cli's derivation in
+        // src/spec-node/dockerCompose.ts: always use
+        // `${workspaceFolderBasename}_devcontainer`, sanitized by lowercasing
+        // and stripping characters outside `[-_a-z0-9]`. Using the
+        // devcontainer.json `name` field here diverges from the reference CLI
+        // and creates duplicate compose projects when the same folder is
+        // opened by both tools — see https://github.com/antont/zed/issues/5.
+        let folder_basename = self
+            .local_workspace_base_name()
+            .unwrap_or_else(|_| self.local_workspace_folder());
+        sanitize_compose_project_name(&format!("{folder_basename}_devcontainer"))
     }
 
     async fn expanded_dockerfile_content(&self) -> Result<String, DevContainerError> {
@@ -2243,6 +2246,17 @@ fn escape_regex_chars(input: &str) -> String {
         result.push(c);
     }
     result
+}
+
+/// Sanitize a string for use as a Docker Compose project name, matching
+/// `@devcontainers/cli`'s `toProjectName` (modern Compose branch): lowercase
+/// the input and strip any character outside `[-_a-z0-9]`.
+fn sanitize_compose_project_name(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| c.to_lowercase())
+        .filter(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || *c == '-' || *c == '_')
+        .collect()
 }
 
 /// Extracts the short feature ID from a full feature reference string.
@@ -3774,6 +3788,32 @@ ENV DOCKER_BUILDKIT=1
             serde_json_lenient::from_str::<DockerComposeConfig>(&runtime_override).unwrap(),
             expected_runtime_override
         )
+    }
+
+    #[test]
+    fn sanitize_compose_project_name_matches_cli_rules() {
+        use crate::devcontainer_manifest::sanitize_compose_project_name;
+
+        // Plain lowercase alnum passes through.
+        assert_eq!(
+            sanitize_compose_project_name("project_devcontainer"),
+            "project_devcontainer"
+        );
+        // Hyphens survive (unlike safe_id_lower which would replace them with _).
+        assert_eq!(
+            sanitize_compose_project_name("devcontainer-compose-test_devcontainer"),
+            "devcontainer-compose-test_devcontainer"
+        );
+        // Uppercase letters are lowercased.
+        assert_eq!(
+            sanitize_compose_project_name("Makermint-Studio_devcontainer"),
+            "makermint-studio_devcontainer"
+        );
+        // Characters outside [-_a-z0-9] are stripped.
+        assert_eq!(
+            sanitize_compose_project_name("Rust & PostgreSQL_devcontainer"),
+            "rustpostgresql_devcontainer"
+        );
     }
 
     #[test]
