@@ -52,7 +52,8 @@ where
         if raw.is_empty() || raw.trim() == "[]" || raw.trim() == "{}" {
             return Ok(None);
         }
-        serde_json_lenient::from_str(&raw).map_err(|e| format!("Error deserializing from raw json: {e}"))
+        serde_json_lenient::from_str(&raw)
+            .map_err(|e| format!("Error deserializing from raw json: {e}"))
     } else {
         let std_err = String::from_utf8_lossy(&output.stderr);
         Err(format!(
@@ -84,7 +85,12 @@ mod tests {
     fn test_deserialize_single_json_object() {
         let output = success_output(r#"{"id":"abc123"}"#);
         let result: Option<TestItem> = deserialize_json_output(output).unwrap();
-        assert_eq!(result, Some(TestItem { id: "abc123".into() }));
+        assert_eq!(
+            result,
+            Some(TestItem {
+                id: "abc123".into()
+            })
+        );
     }
 
     #[test]
