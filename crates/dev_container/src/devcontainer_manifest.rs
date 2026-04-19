@@ -4914,7 +4914,9 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
             .docker
             .set_duplicate_container_ids(vec!["abc123".to_string(), "def456".to_string()]);
 
-        let result = devcontainer_manifest.check_for_existing_devcontainer().await;
+        let result = devcontainer_manifest
+            .check_for_existing_devcontainer()
+            .await;
 
         let Err(DevContainerError::MultipleMatchingContainers(ids)) = result else {
             panic!("expected MultipleMatchingContainers, got {result:?}");
