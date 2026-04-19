@@ -984,8 +984,9 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
             docker_compose_resources.files.push(config_location);
 
+            let project_name = self.project_name().await;
             self.docker_client
-                .docker_compose_build(&docker_compose_resources.files, &self.project_name())
+                .docker_compose_build(&docker_compose_resources.files, &project_name)
                 .await?;
             (
                 self.docker_client
@@ -1076,8 +1077,9 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
                 docker_compose_resources.files.push(config_location);
 
+                let project_name = self.project_name().await;
                 self.docker_client
-                    .docker_compose_build(&docker_compose_resources.files, &self.project_name())
+                    .docker_compose_build(&docker_compose_resources.files, &project_name)
                     .await?;
 
                 (
@@ -1701,7 +1703,8 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         resources: DockerComposeResources,
     ) -> Result<DockerInspect, DevContainerError> {
         let mut command = Command::new(self.docker_client.docker_cli());
-        command.args(&["compose", "--project-name", &self.project_name()]);
+        let project_name = self.project_name().await;
+        command.args(&["compose", "--project-name", &project_name]);
         for docker_compose_file in resources.files {
             command.args(&["-f", &docker_compose_file.display().to_string()]);
         }
@@ -2113,7 +2116,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         &self,
         ids: Vec<String>,
     ) -> Result<Option<DockerPs>, DevContainerError> {
-        let canonical_project = self.project_name();
+        let canonical_project = self.project_name().await;
         let mut canonical: Option<String> = None;
         let mut others: Vec<String> = Vec::new();
         for id in &ids {
@@ -2141,18 +2144,55 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         }
     }
 
-    fn project_name(&self) -> String {
-        // Match @devcontainers/cli's derivation in
-        // src/spec-node/dockerCompose.ts: always use
-        // `${workspaceFolderBasename}_devcontainer`, sanitized by lowercasing
-        // and stripping characters outside `[-_a-z0-9]`. Using the
-        // devcontainer.json `name` field here diverges from the reference CLI
-        // and creates duplicate compose projects when the same folder is
-        // opened by both tools — see https://github.com/antont/zed/issues/5.
-        let folder_basename = self
+    /// Matches `@devcontainers/cli`'s `getProjectName` in
+    /// `src/spec-node/dockerCompose.ts`. See `derive_project_name` for the
+    /// full precedence. Using the devcontainer.json `name` field here
+    /// diverges from the reference CLI and creates duplicate compose
+    /// projects when the same folder is opened by both tools — see
+    /// https://github.com/antont/zed/issues/5.
+    ///
+    /// Async because the derivation reads both the workspace `.env` file
+    /// and the merged compose config — neither of which is available
+    /// synchronously. Non-compose dev containers (`image:` or `dockerfile:`)
+    /// never reach the compose project namespace at runtime, but
+    /// `pick_canonical_container` still consults this value to build its
+    /// tiebreak key. In that case no candidate will carry a
+    /// `com.docker.compose.project` label matching anything we produce here,
+    /// so the tiebreak harmlessly falls through.
+    async fn project_name(&self) -> String {
+        let workspace_fallback = self
             .local_workspace_base_name()
             .unwrap_or_else(|_| self.local_workspace_folder());
-        sanitize_compose_project_name(&format!("{folder_basename}_devcontainer"))
+        let compose_resources = self.docker_compose_manifest().await.ok();
+        let first_compose_file = compose_resources
+            .as_ref()
+            .and_then(|r| r.files.first())
+            .map(PathBuf::as_path);
+        let compose_config_name = compose_resources
+            .as_ref()
+            .and_then(|r| r.config.name.as_deref());
+        let mut compose_name_explicitly_declared = false;
+        if let Some(resources) = &compose_resources {
+            for file in &resources.files {
+                if let Ok(contents) = self.fs.load(file).await
+                    && compose_fragment_declares_name(&contents)
+                {
+                    compose_name_explicitly_declared = true;
+                    break;
+                }
+            }
+        }
+        let dotenv_path = self.local_project_directory.join(".env");
+        let dotenv_contents = self.fs.load(&dotenv_path).await.ok();
+        derive_project_name(
+            &self.local_environment,
+            dotenv_contents.as_deref(),
+            compose_config_name,
+            compose_name_explicitly_declared,
+            first_compose_file,
+            &self.local_project_directory,
+            &workspace_fallback,
+        )
     }
 
     async fn expanded_dockerfile_content(&self) -> Result<String, DevContainerError> {
@@ -2401,20 +2441,103 @@ fn sanitize_compose_project_name(input: &str) -> String {
 }
 
 /// Derive the Docker Compose project name, mirroring `getProjectName` in
-/// `@devcontainers/cli`'s `src/spec-node/dockerCompose.ts`. Stub: currently
-/// implements only the simplest case (workspace basename + `_devcontainer`
-/// suffix) to match the prior `project_name()` behavior. Full precedence —
-/// `COMPOSE_PROJECT_NAME` env, `.env` file, compose `name:`, and the
-/// `.devcontainer`-aware basename fallback — is wired in the GREEN commit.
+/// `@devcontainers/cli`'s `src/spec-node/dockerCompose.ts`. Precedence:
+///
+/// 1. `COMPOSE_PROJECT_NAME` from the local environment.
+/// 2. `COMPOSE_PROJECT_NAME` from the workspace `.env` file.
+/// 3. The top-level `name:` field of the merged compose config, but only
+///    when at least one compose fragment explicitly declared `name:`.
+///    Compose injects a default `name: devcontainer` into its merged
+///    output whenever no fragment declared one — that default must NOT be
+///    treated as a user-provided name, so rule 4 applies instead.
+/// 4. Basename of the first compose file's directory, appending
+///    `_devcontainer` only when that directory is
+///    `<workspace_root>/.devcontainer`.
+///
+/// The caller is responsible for computing `compose_name_explicitly_declared`
+/// by scanning the original compose fragments for a top-level `name:` key
+/// (the reference CLI does the same). This keeps the helper a pure function
+/// of its inputs.
+///
+/// All branches pass through `sanitize_compose_project_name` — the CLI's
+/// final normalization step.
 fn derive_project_name(
-    _local_environment: &HashMap<String, String>,
-    _workspace_dotenv_contents: Option<&str>,
-    _compose_config_name: Option<&str>,
-    _first_compose_file: Option<&Path>,
-    _workspace_root: &Path,
+    local_environment: &HashMap<String, String>,
+    workspace_dotenv_contents: Option<&str>,
+    compose_config_name: Option<&str>,
+    compose_name_explicitly_declared: bool,
+    first_compose_file: Option<&Path>,
+    workspace_root: &Path,
     workspace_fallback: &str,
 ) -> String {
-    sanitize_compose_project_name(&format!("{workspace_fallback}_devcontainer"))
+    if let Some(env_name) = local_environment.get("COMPOSE_PROJECT_NAME")
+        && !env_name.is_empty()
+    {
+        return sanitize_compose_project_name(env_name);
+    }
+    if let Some(contents) = workspace_dotenv_contents
+        && let Some(dotenv_name) = parse_dotenv_compose_project_name(contents)
+        && !dotenv_name.is_empty()
+    {
+        return sanitize_compose_project_name(&dotenv_name);
+    }
+    if let Some(name) = compose_config_name
+        && !name.is_empty()
+        && compose_name_explicitly_declared
+    {
+        return sanitize_compose_project_name(name);
+    }
+    let compose_dir = first_compose_file.and_then(Path::parent);
+    let raw = match compose_dir {
+        Some(dir) if dir == workspace_root.join(".devcontainer") => {
+            // Matches the CLI's `configDir/.devcontainer` branch: use the
+            // *workspace root's* basename with the `_devcontainer` suffix,
+            // NOT the `.devcontainer` dir's basename.
+            format!("{workspace_fallback}_devcontainer")
+        }
+        Some(dir) => dir
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| workspace_fallback.to_string()),
+        None => format!("{workspace_fallback}_devcontainer"),
+    };
+    sanitize_compose_project_name(&raw)
+}
+
+/// Extract `COMPOSE_PROJECT_NAME` from a `.env` file's contents. Matches
+/// the subset of dotenv syntax that `@devcontainers/cli`'s regex parser
+/// recognizes: a bare `COMPOSE_PROJECT_NAME=value` line (no `export` prefix,
+/// no quoting, no line continuation). Comment lines are skipped.
+fn parse_dotenv_compose_project_name(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("COMPOSE_PROJECT_NAME=") {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Detect whether a compose-file fragment declares a top-level `name:` key.
+/// Matches the reference CLI's approach (which re-parses fragments to answer
+/// the same question), but via a line scan rather than full YAML parsing —
+/// adequate for the common YAML styles compose files use (block mappings).
+/// On exotic YAML (anchors, flow-style maps at the root, multi-doc streams)
+/// the scan may miss the declaration; that errs toward rule 4 (basename
+/// fallback), which is also the CLI's behavior on fragment-parse failure.
+fn compose_fragment_declares_name(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        // Top-level keys in YAML block style start at column 0 with no
+        // leading whitespace. Reject comments and indented lines.
+        !line.starts_with(|c: char| c.is_whitespace())
+            && !line.starts_with('#')
+            && line
+                .split_once(':')
+                .is_some_and(|(key, _)| key.trim() == "name")
+    })
 }
 
 /// Extracts the short feature ID from a full feature reference string.
@@ -4041,15 +4164,15 @@ ENV DOCKER_BUILDKIT=1
         // every later source (.env, compose name:, basename fallback).
         use crate::devcontainer_manifest::derive_project_name;
 
-        let env = HashMap::from([(
-            "COMPOSE_PROJECT_NAME".to_string(),
-            "from_env".to_string(),
-        )]);
+        let env = HashMap::from([("COMPOSE_PROJECT_NAME".to_string(), "from_env".to_string())]);
         let got = derive_project_name(
             &env,
             Some("COMPOSE_PROJECT_NAME=from_dotenv\n"),
             Some("from_compose_name"),
-            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            true,
+            Some(Path::new(
+                "/path/to/local/project/.devcontainer/docker-compose.yml",
+            )),
             Path::new("/path/to/local/project"),
             "project",
         );
@@ -4067,7 +4190,10 @@ ENV DOCKER_BUILDKIT=1
             &HashMap::new(),
             Some("# comment\nCOMPOSE_PROJECT_NAME=from_dotenv\n"),
             Some("from_compose_name"),
-            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            true,
+            Some(Path::new(
+                "/path/to/local/project/.devcontainer/docker-compose.yml",
+            )),
             Path::new("/path/to/local/project"),
             "project",
         );
@@ -4086,7 +4212,10 @@ ENV DOCKER_BUILDKIT=1
             &HashMap::new(),
             None,
             Some("My Compose Project"),
-            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            true,
+            Some(Path::new(
+                "/path/to/local/project/.devcontainer/docker-compose.yml",
+            )),
             Path::new("/path/to/local/project"),
             "project",
         );
@@ -4094,24 +4223,24 @@ ENV DOCKER_BUILDKIT=1
     }
 
     #[test]
-    fn derive_project_name_treats_compose_default_name_as_unset() {
+    fn derive_project_name_skips_compose_name_when_not_explicitly_declared() {
         // CLI precedence rule 3 edge case: `docker compose config` injects a
         // default `name: devcontainer` into the merged output whenever no
-        // compose fragment explicitly declared one. `@devcontainers/cli`
-        // special-cases this by tracking whether `name:` was declared; since
-        // Zed reads the merged config without that signal, we mirror the
-        // CLI's effective behavior by treating the literal string
-        // `"devcontainer"` as if no name were set and falling through to
-        // rule 4 (basename-with-suffix). A naive rule-3 implementation that
-        // blindly uses `compose_config_name` would return `"devcontainer"`
-        // here instead of `"myworkspace_devcontainer"`.
+        // compose fragment declared one. `@devcontainers/cli` ignores that
+        // default by tracking per-fragment whether `name:` was declared and
+        // skipping rule 3 if none was. The caller conveys that signal via
+        // `compose_name_explicitly_declared`; when it's `false`, even a
+        // non-empty `compose_config_name` must be skipped so rule 4 applies.
         use crate::devcontainer_manifest::derive_project_name;
 
         let got = derive_project_name(
             &HashMap::new(),
             None,
             Some("devcontainer"),
-            Some(Path::new("/path/to/myworkspace/.devcontainer/docker-compose.yml")),
+            false,
+            Some(Path::new(
+                "/path/to/myworkspace/.devcontainer/docker-compose.yml",
+            )),
             Path::new("/path/to/myworkspace"),
             "myworkspace",
         );
@@ -4132,11 +4261,33 @@ ENV DOCKER_BUILDKIT=1
             &HashMap::new(),
             None,
             None,
+            false,
             Some(Path::new("/path/to/local/project/docker-compose.yml")),
             Path::new("/path/to/local/project"),
             "project",
         );
         assert_eq!(got, "project");
+    }
+
+    #[test]
+    fn compose_fragment_declares_name_detects_top_level_name_key() {
+        // Block-style top-level key — declared.
+        use crate::devcontainer_manifest::compose_fragment_declares_name;
+
+        assert!(compose_fragment_declares_name(
+            "name: my-project\nservices:\n  app:\n    image: foo\n"
+        ));
+        // Indented `name:` belongs to a nested mapping (here a service) and
+        // must NOT count as a top-level declaration.
+        assert!(!compose_fragment_declares_name(
+            "services:\n  app:\n    name: inner\n    image: foo\n"
+        ));
+        // Comment lines are ignored.
+        assert!(!compose_fragment_declares_name(
+            "# name: commented-out\nservices: {}\n"
+        ));
+        // Empty fragment — no declaration.
+        assert!(!compose_fragment_declares_name(""));
     }
 
     #[test]
