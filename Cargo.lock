@@ -4842,6 +4842,7 @@ dependencies = [
 name = "dev_container"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-tar",
  "async-trait",
  "env_logger 0.11.8",
@@ -4859,6 +4860,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_lenient",
+ "serde_yaml",
  "settings",
  "shlex",
  "ui",

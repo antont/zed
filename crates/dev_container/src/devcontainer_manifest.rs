@@ -933,7 +933,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
             docker_compose_resources.files.push(config_location);
 
-            let project_name = self.project_name().await;
+            let project_name = self.project_name().await?;
             self.docker_client
                 .docker_compose_build(&docker_compose_resources.files, &project_name)
                 .await?;
@@ -1026,7 +1026,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
                 docker_compose_resources.files.push(config_location);
 
-                let project_name = self.project_name().await;
+                let project_name = self.project_name().await?;
                 self.docker_client
                     .docker_compose_build(&docker_compose_resources.files, &project_name)
                     .await?;
@@ -1632,7 +1632,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         resources: DockerComposeResources,
     ) -> Result<DockerInspect, DevContainerError> {
         let mut command = Command::new(self.docker_client.docker_cli());
-        let project_name = self.project_name().await;
+        let project_name = self.project_name().await?;
         command.args(&["compose", "--project-name", &project_name]);
         for docker_compose_file in resources.files {
             command.args(&["-f", &docker_compose_file.display().to_string()]);
@@ -2045,7 +2045,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         &self,
         ids: Vec<String>,
     ) -> Result<Option<DockerPs>, DevContainerError> {
-        let canonical_project = self.project_name().await;
+        let canonical_project = self.project_name().await?;
         let mut canonical: Option<String> = None;
         let mut others: Vec<String> = Vec::new();
         for id in &ids {
@@ -2088,7 +2088,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     /// tiebreak key. In that case no candidate will carry a
     /// `com.docker.compose.project` label matching anything we produce here,
     /// so the tiebreak harmlessly falls through.
-    async fn project_name(&self) -> String {
+    async fn project_name(&self) -> Result<String, DevContainerError> {
         let workspace_fallback = self
             .local_workspace_base_name()
             .unwrap_or_else(|_| self.local_workspace_folder());
@@ -2103,17 +2103,43 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         let mut compose_name_explicitly_declared = false;
         if let Some(resources) = &compose_resources {
             for file in &resources.files {
-                if let Ok(contents) = self.fs.load(file).await
-                    && compose_fragment_declares_name(&contents)
-                {
+                let contents = match self.fs.load(file).await {
+                    Ok(contents) => contents,
+                    Err(err) => {
+                        if is_missing_file_error(&err) {
+                            continue;
+                        }
+                        log::error!(
+                            "Failed to read compose fragment `{}` while deriving project name: {err:?}",
+                            file.display()
+                        );
+                        return Err(DevContainerError::FilesystemError);
+                    }
+                };
+                if compose_fragment_declares_name(&contents) {
                     compose_name_explicitly_declared = true;
                     break;
                 }
             }
         }
         let dotenv_path = self.local_project_directory.join(".env");
-        let dotenv_contents = self.fs.load(&dotenv_path).await.ok();
-        derive_project_name(
+        let dotenv_contents = match self.fs.load(&dotenv_path).await {
+            Ok(contents) => Some(contents),
+            Err(err) if is_missing_file_error(&err) => None,
+            Err(err) => {
+                // Mirrors the CLI: `getProjectName` only swallows `ENOENT`/
+                // `EISDIR` on the `.env` read. Any other error (permission
+                // denied, I/O failure, …) must surface so we don't silently
+                // fall back to a non-canonical project name and create a
+                // second compose project for the same repo.
+                log::error!(
+                    "Failed to read workspace .env `{}` while deriving project name: {err:?}",
+                    dotenv_path.display()
+                );
+                return Err(DevContainerError::FilesystemError);
+            }
+        };
+        Ok(derive_project_name(
             &self.local_environment,
             dotenv_contents.as_deref(),
             compose_config_name,
@@ -2121,7 +2147,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             first_compose_file,
             &self.local_project_directory,
             &workspace_fallback,
-        )
+        ))
     }
 
     async fn expanded_dockerfile_content(&self) -> Result<String, DevContainerError> {
@@ -2408,6 +2434,20 @@ fn derive_project_name(
     sanitize_compose_project_name(&raw)
 }
 
+/// Classify an anyhow error from `Fs::load` as "file does not exist" vs a
+/// real I/O failure. Mirrors the CLI's narrow treatment (`ENOENT`/`EISDIR`
+/// only) of read errors as "no `.env` / no fragment": any other error must
+/// propagate so callers can surface the problem instead of silently falling
+/// back to a non-canonical project name.
+fn is_missing_file_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    })
+}
+
 /// Extract `COMPOSE_PROJECT_NAME` from a `.env` file's contents. Matches
 /// the subset of dotenv syntax that `@devcontainers/cli`'s regex parser
 /// recognizes: a bare `COMPOSE_PROJECT_NAME=value` line (no `export` prefix,
@@ -2426,22 +2466,17 @@ fn parse_dotenv_compose_project_name(contents: &str) -> Option<String> {
 }
 
 /// Detect whether a compose-file fragment declares a top-level `name:` key.
-/// Matches the reference CLI's approach (which re-parses fragments to answer
-/// the same question), but via a line scan rather than full YAML parsing —
-/// adequate for the common YAML styles compose files use (block mappings).
-/// On exotic YAML (anchors, flow-style maps at the root, multi-doc streams)
-/// the scan may miss the declaration; that errs toward rule 4 (basename
-/// fallback), which is also the CLI's behavior on fragment-parse failure.
+/// Matches the reference CLI's approach: parse the fragment as YAML and check
+/// for a `name` key on the root mapping. This handles all valid styles —
+/// block mappings, quoted keys (`"name":`), flow-style root mappings, anchors,
+/// etc. On parse failure we fall through (return `false`), matching the CLI's
+/// own behavior when fragment parsing errors.
 fn compose_fragment_declares_name(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        // Top-level keys in YAML block style start at column 0 with no
-        // leading whitespace. Reject comments and indented lines.
-        !line.starts_with(|c: char| c.is_whitespace())
-            && !line.starts_with('#')
-            && line
-                .split_once(':')
-                .is_some_and(|(key, _)| key.trim() == "name")
-    })
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(contents) else {
+        return false;
+    };
+    root.as_mapping()
+        .is_some_and(|m| m.contains_key(serde_yaml::Value::String("name".into())))
 }
 
 /// Extracts the short feature ID from a full feature reference string.
@@ -4110,6 +4145,46 @@ ENV DOCKER_BUILDKIT=1
         ));
         // Empty fragment — no declaration.
         assert!(!compose_fragment_declares_name(""));
+        // Quoted key — still a top-level declaration. A line scanner that
+        // looks for bare `name:` at column 0 would miss this.
+        assert!(compose_fragment_declares_name(
+            "\"name\": my-project\nservices: {}\n"
+        ));
+        // Flow-style root mapping — also a top-level declaration. Again a
+        // line scanner keyed on block-style layout would miss it.
+        assert!(compose_fragment_declares_name(
+            "{name: my-project, services: {app: {image: foo}}}\n"
+        ));
+        // Unparseable fragment falls through to "not declared" (matches the
+        // CLI's behavior on parse failure).
+        assert!(!compose_fragment_declares_name(": : :\n- - -\n"));
+    }
+
+    #[test]
+    fn is_missing_file_error_only_accepts_notfound_and_notadirectory() {
+        // Mirrors the CLI's narrow `ENOENT`/`EISDIR` swallow in
+        // `getProjectName`'s `.env` read. Any other `io::Error` — permission
+        // denied, I/O failure, etc. — must not be classified as "missing"
+        // so callers surface the problem instead of silently falling back
+        // to a non-canonical project name. Non-`io::Error` anyhow errors
+        // must also not be classified as missing.
+        use crate::devcontainer_manifest::is_missing_file_error;
+
+        let notfound = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(is_missing_file_error(&notfound));
+
+        let notadir = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+        assert!(is_missing_file_error(&notadir));
+
+        let permission_denied =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!is_missing_file_error(&permission_denied));
+
+        let other_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::Other));
+        assert!(!is_missing_file_error(&other_io));
+
+        let non_io: anyhow::Error = anyhow::anyhow!("something else");
+        assert!(!is_missing_file_error(&non_io));
     }
 
     #[test]
