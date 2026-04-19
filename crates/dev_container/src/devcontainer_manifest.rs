@@ -2400,6 +2400,23 @@ fn sanitize_compose_project_name(input: &str) -> String {
         .collect()
 }
 
+/// Derive the Docker Compose project name, mirroring `getProjectName` in
+/// `@devcontainers/cli`'s `src/spec-node/dockerCompose.ts`. Stub: currently
+/// implements only the simplest case (workspace basename + `_devcontainer`
+/// suffix) to match the prior `project_name()` behavior. Full precedence —
+/// `COMPOSE_PROJECT_NAME` env, `.env` file, compose `name:`, and the
+/// `.devcontainer`-aware basename fallback — is wired in the GREEN commit.
+fn derive_project_name(
+    _local_environment: &HashMap<String, String>,
+    _workspace_dotenv_contents: Option<&str>,
+    _compose_config_name: Option<&str>,
+    _first_compose_file: Option<&Path>,
+    _workspace_root: &Path,
+    workspace_fallback: &str,
+) -> String {
+    sanitize_compose_project_name(&format!("{workspace_fallback}_devcontainer"))
+}
+
 /// Extracts the short feature ID from a full feature reference string.
 ///
 /// Examples:
@@ -4016,6 +4033,110 @@ ENV DOCKER_BUILDKIT=1
             serde_json_lenient::from_str::<DockerComposeConfig>(&runtime_override).unwrap(),
             expected_runtime_override
         )
+    }
+
+    #[test]
+    fn derive_project_name_env_wins_over_everything() {
+        // CLI precedence rule 1: `COMPOSE_PROJECT_NAME` env var short-circuits
+        // every later source (.env, compose name:, basename fallback).
+        use crate::devcontainer_manifest::derive_project_name;
+
+        let env = HashMap::from([(
+            "COMPOSE_PROJECT_NAME".to_string(),
+            "from_env".to_string(),
+        )]);
+        let got = derive_project_name(
+            &env,
+            Some("COMPOSE_PROJECT_NAME=from_dotenv\n"),
+            Some("from_compose_name"),
+            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got, "from_env");
+    }
+
+    #[test]
+    fn derive_project_name_dotenv_wins_over_compose_and_fallback() {
+        // CLI precedence rule 2: when no env var is set, the workspace .env's
+        // `COMPOSE_PROJECT_NAME=` line wins over the compose config's `name:`
+        // field and the basename fallback.
+        use crate::devcontainer_manifest::derive_project_name;
+
+        let got = derive_project_name(
+            &HashMap::new(),
+            Some("# comment\nCOMPOSE_PROJECT_NAME=from_dotenv\n"),
+            Some("from_compose_name"),
+            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got, "from_dotenv");
+    }
+
+    #[test]
+    fn derive_project_name_compose_name_wins_over_fallback() {
+        // CLI precedence rule 3: when neither env nor .env provide a name,
+        // the merged compose config's top-level `name:` field takes precedence
+        // over the basename fallback. Also covers sanitization (spaces
+        // stripped, uppercase lowercased).
+        use crate::devcontainer_manifest::derive_project_name;
+
+        let got = derive_project_name(
+            &HashMap::new(),
+            None,
+            Some("My Compose Project"),
+            Some(Path::new("/path/to/local/project/.devcontainer/docker-compose.yml")),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got, "mycomposeproject");
+    }
+
+    #[test]
+    fn derive_project_name_treats_compose_default_name_as_unset() {
+        // CLI precedence rule 3 edge case: `docker compose config` injects a
+        // default `name: devcontainer` into the merged output whenever no
+        // compose fragment explicitly declared one. `@devcontainers/cli`
+        // special-cases this by tracking whether `name:` was declared; since
+        // Zed reads the merged config without that signal, we mirror the
+        // CLI's effective behavior by treating the literal string
+        // `"devcontainer"` as if no name were set and falling through to
+        // rule 4 (basename-with-suffix). A naive rule-3 implementation that
+        // blindly uses `compose_config_name` would return `"devcontainer"`
+        // here instead of `"myworkspace_devcontainer"`.
+        use crate::devcontainer_manifest::derive_project_name;
+
+        let got = derive_project_name(
+            &HashMap::new(),
+            None,
+            Some("devcontainer"),
+            Some(Path::new("/path/to/myworkspace/.devcontainer/docker-compose.yml")),
+            Path::new("/path/to/myworkspace"),
+            "myworkspace",
+        );
+        assert_eq!(got, "myworkspace_devcontainer");
+    }
+
+    #[test]
+    fn derive_project_name_omits_suffix_when_compose_file_outside_devcontainer_dir() {
+        // CLI precedence rule 4: when falling back to the first compose file's
+        // directory basename, the `_devcontainer` suffix is only appended when
+        // that directory IS `<config>/.devcontainer`. A compose file at the
+        // workspace root (as `"dockerComposeFile": "../docker-compose.yml"`
+        // produces) must derive to the plain dir basename, not
+        // `project_devcontainer` — otherwise Zed diverges from the CLI.
+        use crate::devcontainer_manifest::derive_project_name;
+
+        let got = derive_project_name(
+            &HashMap::new(),
+            None,
+            None,
+            Some(Path::new("/path/to/local/project/docker-compose.yml")),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got, "project");
     }
 
     #[test]
