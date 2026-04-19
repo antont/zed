@@ -2103,17 +2103,22 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         let mut compose_name_explicitly_declared = false;
         if let Some(resources) = &compose_resources {
             for file in &resources.files {
+                // Mirrors the CLI's fragment re-parse (dockerCompose.ts 663-673):
+                // the whole readFile+yaml.load pair is wrapped in a single
+                // try/catch that swallows every failure. The comment there
+                // calls out `!reset` custom tags; the behavior is "on any
+                // failure, treat the fragment as not-declared and keep
+                // scanning." Propagating an I/O error here would diverge
+                // from that policy and fail the whole devcontainer flow for
+                // a fragment the CLI would have silently skipped.
                 let contents = match self.fs.load(file).await {
                     Ok(contents) => contents,
                     Err(err) => {
-                        if is_missing_file_error(&err) {
-                            continue;
-                        }
-                        log::error!(
-                            "Failed to read compose fragment `{}` while deriving project name: {err:?}",
+                        log::warn!(
+                            "Ignoring unreadable compose fragment `{}` while deriving project name: {err:?}",
                             file.display()
                         );
-                        return Err(DevContainerError::FilesystemError);
+                        continue;
                     }
                 };
                 if compose_fragment_declares_name(&contents) {
@@ -2435,10 +2440,13 @@ fn derive_project_name(
 }
 
 /// Classify an anyhow error from `Fs::load` as "file does not exist" vs a
-/// real I/O failure. Mirrors the CLI's narrow treatment (`ENOENT`/`EISDIR`
-/// only) of read errors as "no `.env` / no fragment": any other error must
-/// propagate so callers can surface the problem instead of silently falling
-/// back to a non-canonical project name.
+/// real I/O failure. Used on the `.env` read in `project_name()`, where the
+/// CLI's `getProjectName` catches only `ENOENT`/`EISDIR` and rethrows
+/// everything else; any other error must propagate so callers can surface
+/// the problem instead of silently falling back to a non-canonical project
+/// name. (The fragment-rescan loop uses a different, broader swallow —
+/// the CLI wraps its fragment read+parse in one try/catch that ignores
+/// every failure.)
 fn is_missing_file_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<std::io::Error>().is_some_and(|e| {
         matches!(
