@@ -2021,11 +2021,10 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             .map(|(k, v)| format!("label={k}={v}"))
             .collect();
         match self.docker_client.find_process_by_filters(filters).await {
-            Ok(v) => Ok(v),
             Err(DevContainerError::MultipleMatchingContainers(ids)) => {
                 self.pick_canonical_container(ids).await
             }
-            Err(other) => Err(other),
+            result => result,
         }
     }
 
