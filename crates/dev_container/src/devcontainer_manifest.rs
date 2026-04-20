@@ -4314,6 +4314,49 @@ ENV DOCKER_BUILDKIT=1
     }
 
     #[test]
+    fn derive_project_name_normalizes_compose_path_for_rule_4() {
+        // `docker_compose_manifest()` builds compose file paths by joining
+        // `self.config_directory` with the raw `dockerComposeFile` entry —
+        // so entries like `"subdir/../docker-compose.yml"` (equivalent to
+        // `"docker-compose.yml"`) yield a path with unresolved `..`
+        // components. `derive_project_name` must normalize before comparing
+        // the parent against `<workspace>/.devcontainer`, otherwise a
+        // semantically-under-`.devcontainer` file takes the wrong branch
+        // and we diverge from the CLI.
+        use crate::devcontainer_manifest::derive_project_name;
+
+        // subdir/.. under .devcontainer: rule 4 applies → ${ws}_devcontainer.
+        let got_under = derive_project_name(
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            Some(Path::new(
+                "/path/to/local/project/.devcontainer/subdir/../docker-compose.yml",
+            )),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got_under, "project_devcontainer");
+
+        // `.devcontainer/..` escapes back to the workspace root: rule 5 (no
+        // suffix). Name comes from the plain basename of the first compose
+        // file's parent — `project`.
+        let got_escaped = derive_project_name(
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            Some(Path::new(
+                "/path/to/local/project/.devcontainer/../docker-compose.yml",
+            )),
+            Path::new("/path/to/local/project"),
+            "project",
+        );
+        assert_eq!(got_escaped, "project");
+    }
+
+    #[test]
     fn compose_fragment_declares_name_detects_top_level_name_key() {
         // Block-style top-level key — declared.
         use crate::devcontainer_manifest::compose_fragment_declares_name;
@@ -4348,20 +4391,27 @@ ENV DOCKER_BUILDKIT=1
     }
 
     #[test]
-    fn is_missing_file_error_only_accepts_notfound_and_notadirectory() {
+    fn is_missing_file_error_only_accepts_notfound_and_isadirectory() {
         // Mirrors the CLI's narrow `ENOENT`/`EISDIR` swallow in
         // `getProjectName`'s `.env` read. Any other `io::Error` — permission
-        // denied, I/O failure, etc. — must not be classified as "missing"
-        // so callers surface the problem instead of silently falling back
-        // to a non-canonical project name. Non-`io::Error` anyhow errors
-        // must also not be classified as missing.
+        // denied, I/O failure, `ENOTDIR`, etc. — must not be classified as
+        // "missing" so callers surface the problem instead of silently
+        // falling back to a non-canonical project name. Non-`io::Error`
+        // anyhow errors must also not be classified as missing.
         use crate::devcontainer_manifest::is_missing_file_error;
 
         let notfound = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(is_missing_file_error(&notfound));
 
-        let notadir = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotADirectory));
-        assert!(is_missing_file_error(&notadir));
+        // EISDIR — `.env` exists as a directory; CLI swallows, so must we.
+        let is_a_dir = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+        assert!(is_missing_file_error(&is_a_dir));
+
+        // ENOTDIR — a path component isn't a directory; CLI does NOT
+        // swallow this (its catch is narrow to ENOENT/EISDIR), so we must
+        // propagate it as a real failure.
+        let not_a_dir = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotADirectory));
+        assert!(!is_missing_file_error(&not_a_dir));
 
         let permission_denied =
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
