@@ -2519,9 +2519,18 @@ fn derive_project_name(
     {
         return sanitize_compose_project_name(name);
     }
-    let compose_dir = first_compose_file.and_then(Path::parent);
-    let raw = match compose_dir {
-        Some(dir) if dir == workspace_root.join(".devcontainer") => {
+    // `docker_compose_manifest()` joins `self.config_directory` with each
+    // raw `dockerComposeFile` entry verbatim, so paths can carry `..`
+    // components. Normalize before comparing against `<workspace>/.devcontainer`
+    // and before taking `file_name()`, otherwise `subdir/..` under
+    // `.devcontainer` misses rule 4 and a trailing `..` produces `None`
+    // from `file_name()`.
+    let compose_dir = first_compose_file
+        .and_then(Path::parent)
+        .map(normalize_path);
+    let canonical_devcontainer_dir = normalize_path(&workspace_root.join(".devcontainer"));
+    let raw = match compose_dir.as_deref() {
+        Some(dir) if dir == canonical_devcontainer_dir => {
             // Matches the CLI's `configDir/.devcontainer` branch: use the
             // *workspace root's* basename with the `_devcontainer` suffix,
             // NOT the `.devcontainer` dir's basename.
@@ -2548,7 +2557,7 @@ fn is_missing_file_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<std::io::Error>().is_some_and(|e| {
         matches!(
             e.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
         )
     })
 }
