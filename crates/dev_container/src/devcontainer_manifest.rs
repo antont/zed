@@ -2108,39 +2108,40 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     /// when zero or ≥2 candidates claim the canonical project — users then
     /// have to clean up the duplicate state themselves, per #54068.
     ///
-    /// Handles the common upgrade path where a Zed install from before the
-    /// compose-project-name fix (PR #6) left behind a container under the
-    /// legacy `safe_id_lower(devcontainer.name)` project, now colliding at
-    /// the label layer with a new container under the canonical project.
+    /// Covers the narrow case where a pre-fix Zed left a container under the
+    /// legacy `safe_id_lower(devcontainer.name)` project and a CLI-style
+    /// container for the same folder now coexists — the identifying-labels
+    /// query returns both, and the canonical-project filter picks the one
+    /// matching the current derivation.
     async fn pick_canonical_container(
         &self,
         ids: Vec<String>,
     ) -> Result<Option<DockerPs>, DevContainerError> {
         let canonical_project = self.project_name().await?;
-        let mut canonical: Option<String> = None;
-        let mut others: Vec<String> = Vec::new();
+        let mut canonical_ids: Vec<String> = Vec::new();
+        let mut other_ids: Vec<String> = Vec::new();
         for id in &ids {
             let inspect = self.docker_client.inspect(id).await?;
             if inspect.config.labels.compose_project.as_deref() == Some(canonical_project.as_str())
             {
-                if canonical.is_some() {
-                    return Err(DevContainerError::MultipleMatchingContainers(ids));
-                }
-                canonical = Some(id.clone());
+                canonical_ids.push(id.clone());
             } else {
-                others.push(id.clone());
+                other_ids.push(id.clone());
             }
         }
-        match canonical {
-            Some(id) => {
+        match canonical_ids.as_slice() {
+            [canonical_id] => {
                 log::warn!(
-                    "Multiple containers match dev container labels; reusing `{id}` under \
-                     compose project `{canonical_project}`, ignoring legacy duplicate(s): {}",
-                    others.join(", ")
+                    "Multiple containers match dev container labels; reusing `{canonical_id}` \
+                     under compose project `{canonical_project}`, ignoring legacy \
+                     duplicate(s): {}",
+                    other_ids.join(", ")
                 );
-                Ok(Some(DockerPs { id }))
+                Ok(Some(DockerPs {
+                    id: canonical_id.clone(),
+                }))
             }
-            None => Err(DevContainerError::MultipleMatchingContainers(ids)),
+            _ => Err(DevContainerError::MultipleMatchingContainers(ids)),
         }
     }
 
