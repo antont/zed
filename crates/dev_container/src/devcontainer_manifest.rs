@@ -4336,7 +4336,7 @@ ENV DOCKER_BUILDKIT=1
         assert!(compose_fragment_declares_name(
             "{name: my-project, services: {app: {image: foo}}}\n"
         ));
-        // Unparseable fragment falls through to "not declared" (matches the
+        // Unparsable fragment falls through to "not declared" (matches the
         // CLI's behavior on parse failure).
         assert!(!compose_fragment_declares_name(": : :\n- - -\n"));
     }
