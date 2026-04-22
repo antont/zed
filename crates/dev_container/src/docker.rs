@@ -39,8 +39,6 @@ pub(crate) struct DockerConfigLabels {
         deserialize_with = "deserialize_metadata"
     )]
     pub(crate) metadata: Option<Vec<HashMap<String, serde_json_lenient::Value>>>,
-    #[serde(default, rename = "com.docker.compose.project")]
-    pub(crate) compose_project: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
@@ -592,10 +590,7 @@ mod test {
     #[test]
     fn should_parse_simple_env_var() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels {
-                metadata: None,
-                compose_project: None,
-            },
+            labels: super::DockerConfigLabels { metadata: None },
             image_user: None,
             env: vec!["KEY=value".to_string()],
         };
@@ -607,10 +602,7 @@ mod test {
     #[test]
     fn should_parse_env_var_with_equals_in_value() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels {
-                metadata: None,
-                compose_project: None,
-            },
+            labels: super::DockerConfigLabels { metadata: None },
             image_user: None,
             env: vec!["COMPLEX=key=val other>=1.0".to_string()],
         };
@@ -622,10 +614,7 @@ mod test {
     #[test]
     fn should_parse_database_url_with_equals_in_query_string() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels {
-                metadata: None,
-                compose_project: None,
-            },
+            labels: super::DockerConfigLabels { metadata: None },
             image_user: None,
             env: vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -644,10 +633,7 @@ mod test {
     #[test]
     fn should_skip_env_var_without_equals() {
         let config = super::DockerInspectConfig {
-            labels: super::DockerConfigLabels {
-                metadata: None,
-                compose_project: None,
-            },
+            labels: super::DockerConfigLabels { metadata: None },
             image_user: None,
             env: vec![
                 "VALID_KEY=valid_value".to_string(),
@@ -1156,32 +1142,6 @@ mod test {
         "#;
 
         let inspect: DockerInspect = serde_json_lenient::from_str(given_config).unwrap();
-        assert!(inspect.config.labels.metadata.is_none());
-    }
-
-    #[test]
-    fn should_deserialize_inspect_with_compose_project_label() {
-        // Guards the `com.docker.compose.project` serde rename on
-        // `DockerConfigLabels`, which the multi-match tiebreak in
-        // `check_for_existing_container` reads directly from real
-        // `docker inspect` output.
-        let given_config = r#"
-        {
-            "Id": "sha256:abc123",
-            "Config": {
-                "Labels": {
-                    "com.docker.compose.project": "devcontainer-compose-test_devcontainer",
-                    "devcontainer.local_folder": "/path/to/project"
-                }
-            }
-        }
-        "#;
-
-        let inspect: DockerInspect = serde_json_lenient::from_str(given_config).unwrap();
-        assert_eq!(
-            inspect.config.labels.compose_project.as_deref(),
-            Some("devcontainer-compose-test_devcontainer")
-        );
         assert!(inspect.config.labels.metadata.is_none());
     }
 }

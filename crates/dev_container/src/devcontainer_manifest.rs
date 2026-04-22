@@ -2089,77 +2089,25 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     }
 
     async fn check_for_existing_container(&self) -> Result<Option<DockerPs>, DevContainerError> {
-        let filters = self
-            .identifying_labels()
-            .iter()
-            .map(|(k, v)| format!("label={k}={v}"))
-            .collect();
-        match self.docker_client.find_process_by_filters(filters).await {
-            Err(DevContainerError::MultipleMatchingContainers(ids)) => {
-                self.pick_canonical_container(ids).await
-            }
-            result => result,
-        }
-    }
-
-    /// Resolves a multi-match against the identifying labels by preferring
-    /// the container whose `com.docker.compose.project` label equals
-    /// `self.project_name()`. Falls through to `MultipleMatchingContainers`
-    /// when zero or ≥2 candidates claim the canonical project — users then
-    /// have to clean up the duplicate state themselves, per #54068.
-    ///
-    /// Covers the narrow case where a pre-fix Zed left a container under the
-    /// legacy `safe_id_lower(devcontainer.name)` project and a CLI-style
-    /// container for the same folder now coexists — the identifying-labels
-    /// query returns both, and the canonical-project filter picks the one
-    /// matching the current derivation.
-    async fn pick_canonical_container(
-        &self,
-        ids: Vec<String>,
-    ) -> Result<Option<DockerPs>, DevContainerError> {
-        let canonical_project = self.project_name().await?;
-        let mut canonical_ids: Vec<String> = Vec::new();
-        let mut other_ids: Vec<String> = Vec::new();
-        for id in &ids {
-            let inspect = self.docker_client.inspect(id).await?;
-            if inspect.config.labels.compose_project.as_deref() == Some(canonical_project.as_str())
-            {
-                canonical_ids.push(id.clone());
-            } else {
-                other_ids.push(id.clone());
-            }
-        }
-        match canonical_ids.as_slice() {
-            [canonical_id] => {
-                log::warn!(
-                    "Multiple containers match dev container labels; reusing `{canonical_id}` \
-                     under compose project `{canonical_project}`, ignoring legacy \
-                     duplicate(s): {}",
-                    other_ids.join(", ")
-                );
-                Ok(Some(DockerPs {
-                    id: canonical_id.clone(),
-                }))
-            }
-            _ => Err(DevContainerError::MultipleMatchingContainers(ids)),
-        }
+        self.docker_client
+            .find_process_by_filters(
+                self.identifying_labels()
+                    .iter()
+                    .map(|(k, v)| format!("label={k}={v}"))
+                    .collect(),
+            )
+            .await
     }
 
     /// Matches `@devcontainers/cli`'s `getProjectName` in
     /// `src/spec-node/dockerCompose.ts`. See `derive_project_name` for the
     /// full precedence. Using the devcontainer.json `name` field here
     /// diverges from the reference CLI and creates duplicate compose
-    /// projects when the same folder is opened by both tools — see
-    /// https://github.com/antont/zed/issues/5.
+    /// projects when the same folder is opened by both tools — see #54255.
     ///
     /// Async because the derivation reads both the workspace `.env` file
     /// and the merged compose config — neither of which is available
-    /// synchronously. Non-compose dev containers (`image:` or `dockerfile:`)
-    /// never reach the compose project namespace at runtime, but
-    /// `pick_canonical_container` still consults this value to build its
-    /// tiebreak key. In that case no candidate will carry a
-    /// `com.docker.compose.project` label matching anything we produce here,
-    /// so the tiebreak harmlessly falls through.
+    /// synchronously.
     async fn project_name(&self) -> Result<String, DevContainerError> {
         let workspace_fallback = self
             .local_workspace_base_name()
@@ -3052,7 +3000,6 @@ mod test {
             config: DockerInspectConfig {
                 labels: DockerConfigLabels {
                     metadata: Some(vec![metadata]),
-                    compose_project: None,
                 },
                 image_user: None,
                 env: Vec::new(),
@@ -3081,7 +3028,6 @@ mod test {
             config: DockerInspectConfig {
                 labels: DockerConfigLabels {
                     metadata: Some(vec![metadata]),
-                    compose_project: None,
                 },
                 image_user: None,
                 env: Vec::new(),
@@ -3137,8 +3083,7 @@ mod test {
                 config: DockerInspectConfig {
                     labels: DockerConfigLabels {
                         metadata: None,
-                        compose_project: None,
-                    },
+                        },
                     image_user: None,
                     env: Vec::new(),
                 },
@@ -5656,16 +5601,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         test_dependencies
             .docker
             .set_duplicate_container_ids(vec!["abc123".to_string(), "def456".to_string()]);
-        // Both candidates claim non-canonical compose projects, so the
-        // tiebreak introduced above falls through to the safety-net error.
-        test_dependencies.docker.add_inspect_override(
-            "abc123".to_string(),
-            docker_inspect_with_compose_project("abc123", "non_canonical_a"),
-        );
-        test_dependencies.docker.add_inspect_override(
-            "def456".to_string(),
-            docker_inspect_with_compose_project("def456", "non_canonical_b"),
-        );
 
         let result = devcontainer_manifest
             .check_for_existing_devcontainer()
@@ -5675,93 +5610,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
             panic!("expected MultipleMatchingContainers, got {result:?}");
         };
         assert_eq!(ids, vec!["abc123".to_string(), "def456".to_string()]);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn docker_inspect_with_compose_project(id: &str, compose_project: &str) -> DockerInspect {
-        DockerInspect {
-            id: id.to_string(),
-            config: DockerInspectConfig {
-                labels: DockerConfigLabels {
-                    metadata: None,
-                    compose_project: Some(compose_project.to_string()),
-                },
-                image_user: None,
-                env: Vec::new(),
-            },
-            mounts: None,
-            state: None,
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[gpui::test]
-    async fn check_for_existing_container_prefers_canonical_compose_project(
-        cx: &mut TestAppContext,
-    ) {
-        // Upgrade scenario: a pre-existing Zed container under the legacy
-        // `safe_id_lower(name)` compose project collides at the label layer
-        // with a container under the new CLI-matching project. Labels +
-        // project-name derivation (PR #6) mean one of the candidates lives
-        // under the canonical `project_name()`; prefer that one and treat the
-        // other as an orphan to ignore.
-        cx.executor().allow_parking();
-        let (test_dependencies, devcontainer_manifest) =
-            init_default_devcontainer_manifest(cx, r#"{"name": "Rust and PostgreSQL"}"#)
-                .await
-                .unwrap();
-        test_dependencies
-            .docker
-            .set_duplicate_container_ids(vec!["canonical_id".to_string(), "legacy_id".to_string()]);
-        // `project_name()` for TEST_PROJECT_PATH (`/path/to/local/project`)
-        // resolves to `project_devcontainer` under the PR #6 derivation.
-        test_dependencies.docker.add_inspect_override(
-            "canonical_id".to_string(),
-            docker_inspect_with_compose_project("canonical_id", "project_devcontainer"),
-        );
-        test_dependencies.docker.add_inspect_override(
-            "legacy_id".to_string(),
-            docker_inspect_with_compose_project("legacy_id", "rust_and_postgresql"),
-        );
-
-        let result = devcontainer_manifest.check_for_existing_container().await;
-
-        let Ok(Some(docker_ps)) = result else {
-            panic!("expected Ok(Some(canonical)), got {result:?}");
-        };
-        assert_eq!(docker_ps.id, "canonical_id".to_string());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[gpui::test]
-    async fn check_for_existing_container_errors_when_none_canonical(cx: &mut TestAppContext) {
-        // When none of the multi-match candidates claim the canonical compose
-        // project, fall through to the safety net from #54068 so the user
-        // must resolve the ambiguity manually — the tiebreak must not pick
-        // an arbitrary container.
-        cx.executor().allow_parking();
-        let (test_dependencies, devcontainer_manifest) =
-            init_default_devcontainer_manifest(cx, r#"{"image": "image"}"#)
-                .await
-                .unwrap();
-        test_dependencies
-            .docker
-            .set_duplicate_container_ids(vec!["foo_id".to_string(), "bar_id".to_string()]);
-        test_dependencies.docker.add_inspect_override(
-            "foo_id".to_string(),
-            docker_inspect_with_compose_project("foo_id", "foo_project"),
-        );
-        test_dependencies.docker.add_inspect_override(
-            "bar_id".to_string(),
-            docker_inspect_with_compose_project("bar_id", "bar_project"),
-        );
-
-        let result = devcontainer_manifest.check_for_existing_container().await;
-
-        let Err(DevContainerError::MultipleMatchingContainers(ids)) = result else {
-            panic!("expected MultipleMatchingContainers, got {result:?}");
-        };
-        assert_eq!(ids, vec!["foo_id".to_string(), "bar_id".to_string()]);
     }
 
     #[test]
@@ -5789,10 +5637,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
         /// `MultipleMatchingContainers` with these IDs. Used to exercise the
         /// duplicate-container error path.
         duplicate_container_ids: Mutex<Option<Vec<String>>>,
-        /// Per-ID inspect responses consulted before the hardcoded pattern
-        /// matches in `inspect`. Lets tests that exercise multi-match recovery
-        /// control the `com.docker.compose.project` label of each candidate.
-        inspect_overrides: Mutex<HashMap<String, DockerInspect>>,
     }
 
     impl FakeDocker {
@@ -5802,7 +5646,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                 has_buildx: true,
                 exec_commands_recorded: Mutex::new(Vec::new()),
                 duplicate_container_ids: Mutex::new(None),
-                inspect_overrides: Mutex::new(HashMap::new()),
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -5816,27 +5659,11 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                 .lock()
                 .expect("should be available") = Some(ids);
         }
-        #[cfg(not(target_os = "windows"))]
-        fn add_inspect_override(&self, id: String, inspect: DockerInspect) {
-            self.inspect_overrides
-                .lock()
-                .expect("should be available")
-                .insert(id, inspect);
-        }
     }
 
     #[async_trait]
     impl DockerClient for FakeDocker {
         async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError> {
-            if let Some(inspect) = self
-                .inspect_overrides
-                .lock()
-                .expect("should be available")
-                .get(id)
-                .cloned()
-            {
-                return Ok(inspect);
-            }
             if id == "mcr.microsoft.com/devcontainers/typescript-node:1-18-bookworm" {
                 return Ok(DockerInspect {
                     id: "sha256:610e6cfca95280188b021774f8cf69dd6f49bdb6eebc34c5ee2010f4d51cc104"
@@ -5847,7 +5674,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         env: Vec::new(),
                         image_user: Some("root".to_string()),
@@ -5866,7 +5692,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("vscode".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: Vec::new(),
@@ -5885,7 +5710,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: vec!["PATH=/initial/path".to_string()],
@@ -5904,7 +5728,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: vec!["PATH=/initial/path".to_string()],
@@ -5926,7 +5749,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("vscode".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         image_user: Some("root".to_string()),
                         env: Vec::new(),
@@ -5945,7 +5767,6 @@ FROM docker.io/hexpm/elixir:1.21-erlang-28.4.1-debian-trixie-20260316-slim AS de
                                 "remoteUser".to_string(),
                                 Value::String("node".to_string()),
                             )])]),
-                            compose_project: None,
                         },
                         env: Vec::new(),
                         image_user: Some("root".to_string()),
