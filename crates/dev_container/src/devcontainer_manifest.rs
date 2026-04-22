@@ -848,9 +848,14 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         let Some(docker_compose_files) = dev_container.docker_compose_file.clone() else {
             return Err(DevContainerError::DevContainerParseFailed);
         };
+        // Normalize upfront so every downstream consumer of
+        // `DockerComposeResources.files` (compose fragment reads, project-name
+        // derivation, `docker compose -f` invocations, …) sees resolved paths.
+        // `dockerComposeFile` entries are joined verbatim with
+        // `config_directory`, so raw entries can carry `..` components.
         let docker_compose_full_paths = docker_compose_files
             .iter()
-            .map(|relative| self.config_directory.join(relative))
+            .map(|relative| normalize_path(&self.config_directory.join(relative)))
             .collect::<Vec<PathBuf>>();
 
         let Some(config) = self
@@ -2467,17 +2472,9 @@ fn derive_project_name(
     {
         return sanitize_compose_project_name(name);
     }
-    // `docker_compose_manifest()` joins `self.config_directory` with each
-    // raw `dockerComposeFile` entry verbatim, so paths can carry `..`
-    // components. Normalize before comparing against `<workspace>/.devcontainer`
-    // and before taking `file_name()`, otherwise `subdir/..` under
-    // `.devcontainer` misses rule 4 and a trailing `..` produces `None`
-    // from `file_name()`.
-    let compose_dir = first_compose_file
-        .and_then(Path::parent)
-        .map(normalize_path);
+    let compose_dir = first_compose_file.and_then(Path::parent);
     let canonical_devcontainer_dir = normalize_path(&workspace_root.join(".devcontainer"));
-    let raw = match compose_dir.as_deref() {
+    let raw = match compose_dir {
         Some(dir) if dir == canonical_devcontainer_dir => {
             // Matches the CLI's `configDir/.devcontainer` branch: use the
             // *workspace root's* basename with the `_devcontainer` suffix,
@@ -4270,42 +4267,40 @@ ENV DOCKER_BUILDKIT=1
     }
 
     #[test]
-    fn derive_project_name_normalizes_compose_path_for_rule_4() {
-        // `docker_compose_manifest()` builds compose file paths by joining
-        // `self.config_directory` with the raw `dockerComposeFile` entry —
-        // so entries like `"subdir/../docker-compose.yml"` (equivalent to
-        // `"docker-compose.yml"`) yield a path with unresolved `..`
-        // components. `derive_project_name` must normalize before comparing
-        // the parent against `<workspace>/.devcontainer`, otherwise a
-        // semantically-under-`.devcontainer` file takes the wrong branch
-        // and we diverge from the CLI.
+    fn derive_project_name_handles_resolved_paths_from_docker_compose_manifest() {
+        // `docker_compose_manifest()` normalizes compose file paths upfront
+        // (resolving `..` components from raw `dockerComposeFile` entries like
+        // `"subdir/../docker-compose.yml"`) before populating
+        // `DockerComposeResources.files`. This test pins the resulting
+        // rule-4/rule-5 behavior on those normalized paths: a file
+        // semantically under `<workspace>/.devcontainer` takes rule 4, and
+        // one that resolves outside it takes rule 5.
         use crate::devcontainer_manifest::derive_project_name;
 
-        // subdir/.. under .devcontainer: rule 4 applies → ${ws}_devcontainer.
+        // Normalized equivalent of `.devcontainer/subdir/../docker-compose.yml`:
+        // rule 4 applies → `${ws}_devcontainer`.
         let got_under = derive_project_name(
             &HashMap::new(),
             None,
             None,
             false,
             Some(Path::new(
-                "/path/to/local/project/.devcontainer/subdir/../docker-compose.yml",
+                "/path/to/local/project/.devcontainer/docker-compose.yml",
             )),
             Path::new("/path/to/local/project"),
             "project",
         );
         assert_eq!(got_under, "project_devcontainer");
 
-        // `.devcontainer/..` escapes back to the workspace root: rule 5 (no
-        // suffix). Name comes from the plain basename of the first compose
-        // file's parent — `project`.
+        // Normalized equivalent of `.devcontainer/../docker-compose.yml`:
+        // the file sits at the workspace root, so rule 5 applies — plain
+        // basename of the parent dir, no suffix.
         let got_escaped = derive_project_name(
             &HashMap::new(),
             None,
             None,
             false,
-            Some(Path::new(
-                "/path/to/local/project/.devcontainer/../docker-compose.yml",
-            )),
+            Some(Path::new("/path/to/local/project/docker-compose.yml")),
             Path::new("/path/to/local/project"),
             "project",
         );
