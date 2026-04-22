@@ -2534,11 +2534,13 @@ fn parse_dotenv_compose_project_name(contents: &str) -> Option<String> {
 /// etc. On parse failure we fall through (return `false`), matching the CLI's
 /// own behavior when fragment parsing errors.
 fn compose_fragment_declares_name(contents: &str) -> bool {
-    let Ok(root) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(contents) else {
+    let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(contents) else {
         return false;
     };
-    root.as_mapping()
-        .is_some_and(|m| m.contains_key(serde_yaml_ng::Value::String("name".into())))
+    let Some(yaml_rust2::Yaml::Hash(h)) = docs.into_iter().next() else {
+        return false;
+    };
+    h.contains_key(&yaml_rust2::Yaml::String("name".to_string()))
 }
 
 /// Extracts the short feature ID from a full feature reference string.
