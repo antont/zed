@@ -502,6 +502,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_relative_line_numbers);
         register_action(editor, window, Editor::toggle_indent_guides);
         register_action(editor, window, Editor::toggle_inlay_hints);
+        register_action(editor, window, Editor::toggle_code_lens_action);
         register_action(editor, window, Editor::toggle_semantic_highlights);
         register_action(editor, window, Editor::toggle_edit_predictions);
         if editor.read(cx).diagnostics_enabled() {
@@ -2537,7 +2538,9 @@ impl EditorElement {
 
         let icon_size = ui::IconSize::XSmall;
         let mut button = self.editor.update(cx, |editor, cx| {
-            editor.available_code_actions.as_ref()?;
+            if !editor.has_available_code_actions_for_selection() {
+                return None;
+            }
             let active = editor
                 .context_menu
                 .borrow()

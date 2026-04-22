@@ -16,6 +16,7 @@ pub mod blink_manager;
 mod bracket_colorization;
 mod clangd_ext;
 pub mod code_context_menus;
+mod code_lens;
 pub mod display_map;
 mod document_colors;
 mod document_symbols;
@@ -98,6 +99,7 @@ use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
     CompletionsMenu, ContextMenuOrigin,
 };
+use code_lens::CodeLensState;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
 use dap::TelemetrySpawnLocation;
@@ -111,7 +113,7 @@ use editor_settings::{GoToDefinitionFallback, Minimap as MinimapSettings};
 use element::{LineWithInvisibles, PositionMap, layout_line};
 use futures::{
     FutureExt,
-    future::{self, Shared, join},
+    future::{self, Shared},
 };
 use fuzzy::{StringMatch, StringMatchCandidate};
 use git::blame::{GitBlame, GlobalBlameRenderer};
@@ -1125,6 +1127,18 @@ pub(crate) struct DiffReviewOverlay {
     _subscription: Subscription,
 }
 
+enum CodeActionsForSelection {
+    None,
+    Fetching(Shared<Task<Option<ActionFetchReady>>>),
+    Ready(ActionFetchReady),
+}
+
+#[derive(Clone)]
+struct ActionFetchReady {
+    location: Location,
+    actions: Rc<[AvailableCodeAction]>,
+}
+
 /// Zed's primary implementation of text input, allowing users to edit a [`MultiBuffer`].
 ///
 /// See the [module level documentation](self) for more information.
@@ -1213,8 +1227,8 @@ pub struct Editor {
     auto_signature_help: Option<bool>,
     find_all_references_task_sources: Vec<Anchor>,
     next_completion_id: CompletionId,
-    available_code_actions: Option<(Location, Rc<[AvailableCodeAction]>)>,
-    code_actions_task: Option<Task<Result<()>>>,
+    code_actions_for_selection: CodeActionsForSelection,
+    runnables_for_selection_toggle: Task<()>,
     quick_selection_highlight_task: Option<(Range<Anchor>, Task<()>)>,
     debounced_selection_highlight_task: Option<(Range<Anchor>, Task<()>)>,
     debounced_selection_highlight_complete: bool,
@@ -1338,8 +1352,10 @@ pub struct Editor {
 
     selection_drag_state: SelectionDragState,
     colors: Option<LspColorData>,
+    code_lens: Option<CodeLensState>,
     post_scroll_update: Task<()>,
     refresh_colors_task: Task<()>,
+    refresh_code_lens_task: Task<()>,
     use_document_folding_ranges: bool,
     refresh_folding_ranges_task: Task<()>,
     inlay_hints: Option<LspInlayHintData>,
@@ -2162,7 +2178,7 @@ impl Editor {
                 window,
                 |editor, _, event, window, cx| match event {
                     project::Event::RefreshCodeLens => {
-                        // we always query lens with actions, without storing them, always refreshing them
+                        editor.refresh_code_lenses(None, window, cx);
                     }
                     project::Event::RefreshInlayHints {
                         server_id,
@@ -2227,7 +2243,7 @@ impl Editor {
                             editor.update_lsp_data(Some(buffer_id), window, cx);
                             editor.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
                             refresh_linked_ranges(editor, window, cx);
-                            editor.refresh_code_actions(window, cx);
+                            editor.refresh_code_actions_for_selection(window, cx);
                             editor.refresh_document_highlights(cx);
                         }
                     }
@@ -2475,8 +2491,8 @@ impl Editor {
             next_completion_id: 0,
             next_inlay_id: 0,
             code_action_providers,
-            available_code_actions: None,
-            code_actions_task: None,
+            code_actions_for_selection: CodeActionsForSelection::None,
+            runnables_for_selection_toggle: Task::ready(()),
             quick_selection_highlight_task: None,
             debounced_selection_highlight_task: None,
             debounced_selection_highlight_complete: false,
@@ -2591,7 +2607,9 @@ impl Editor {
             runnables: RunnableData::new(),
             pull_diagnostics_task: Task::ready(()),
             colors: None,
+            code_lens: None,
             refresh_colors_task: Task::ready(()),
+            refresh_code_lens_task: Task::ready(()),
             use_document_folding_ranges: false,
             refresh_folding_ranges_task: Task::ready(()),
             inlay_hints: None,
@@ -2763,6 +2781,9 @@ impl Editor {
             editor.colors = Some(LspColorData::new(cx));
             editor.use_document_folding_ranges = true;
             editor.inlay_hints = Some(LspInlayHintData::new(inlay_hint_settings));
+            if EditorSettings::get_global(cx).code_lens.inline() {
+                editor.code_lens = Some(CodeLensState::default());
+            }
 
             if let Some(buffer) = multi_buffer.read(cx).as_singleton() {
                 editor.register_buffer(buffer.read(cx).remote_id(), cx);
@@ -3796,12 +3817,7 @@ impl Editor {
 
             hide_hover(self, cx);
 
-            if old_cursor_position.to_display_point(&display_map).row()
-                != new_cursor_position.to_display_point(&display_map).row()
-            {
-                self.available_code_actions.take();
-            }
-            self.refresh_code_actions(window, cx);
+            self.refresh_code_actions_for_selection(window, cx);
             self.refresh_document_highlights(cx);
             refresh_linked_ranges(self, window, cx);
 
@@ -6941,6 +6957,9 @@ impl Editor {
         }))
     }
 
+    /// Toggles an action selection menu for the latest selection.
+    /// May show LSP code actions, code lens' command, runnables and potentially more entities applicable as actions.
+    /// Previous menu toggled with this method will be closed.
     pub fn toggle_code_actions(
         &mut self,
         action: &ToggleCodeActions,
@@ -6995,16 +7014,7 @@ impl Editor {
             .runnables((buffer_id, buffer_row))
             .map(|t| Arc::new(t.to_owned()));
 
-        if !self.focus_handle.is_focused(window) {
-            return;
-        }
         let project = self.project.clone();
-
-        let code_actions_task = match deployed_from {
-            Some(CodeActionSource::RunMenu(_)) => Task::ready(None),
-            _ => self.code_actions(buffer_row, window, cx),
-        };
-
         let runnable_task = match deployed_from {
             Some(CodeActionSource::Indicator(_)) => Task::ready(Ok(Default::default())),
             _ => {
@@ -7042,19 +7052,42 @@ impl Editor {
             }
         };
 
-        cx.spawn_in(window, async move |editor, cx| {
+        let toggle_task = cx.spawn_in(window, async move |editor, cx| {
             let (resolved_tasks, debug_scenarios, task_context) = runnable_task.await?;
-            let code_actions = code_actions_task.await;
-            let spawn_straight_away = quick_launch
-                && resolved_tasks
-                    .as_ref()
-                    .is_some_and(|tasks| tasks.templates.len() == 1)
-                && code_actions
-                    .as_ref()
-                    .is_none_or(|actions| actions.is_empty())
-                && debug_scenarios.is_empty();
+
+            let code_actions = if let Some(CodeActionSource::RunMenu(_)) = &deployed_from {
+                None
+            } else {
+                editor.update(cx, |editor, _cx| match &editor.code_actions_for_selection {
+                    CodeActionsForSelection::None => None,
+                    CodeActionsForSelection::Fetching(task) => Some(task.clone()),
+                    CodeActionsForSelection::Ready(action_fetch_ready) => {
+                        Some(Task::ready(Some(action_fetch_ready.clone())).shared())
+                    }
+                })?
+            };
+            let code_actions = match code_actions {
+                Some(code_actions) => code_actions
+                    .await
+                    .filter(|ActionFetchReady { location, .. }| {
+                        let snapshot = location.buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                        let point_range = location.range.to_point(&snapshot);
+                        (point_range.start.row..=point_range.end.row).contains(&buffer_row)
+                    })
+                    .map(|ActionFetchReady { actions, .. }| actions),
+                None => None,
+            };
 
             editor.update_in(cx, |editor, window, cx| {
+                let spawn_straight_away = quick_launch
+                    && resolved_tasks
+                        .as_ref()
+                        .is_some_and(|tasks| tasks.templates.len() == 1)
+                    && code_actions
+                        .as_ref()
+                        .is_none_or(|actions| actions.is_empty())
+                    && debug_scenarios.is_empty();
+
                 crate::hover_popover::hide_hover(editor, cx);
                 let actions = CodeActionContents::new(
                     resolved_tasks,
@@ -7090,8 +7123,16 @@ impl Editor {
 
                 Task::ready(Ok(()))
             })
+        });
+        self.runnables_for_selection_toggle = cx.background_spawn(async move {
+            match toggle_task.await {
+                Ok(code_action_spawn) => match code_action_spawn.await {
+                    Ok(()) => {}
+                    Err(e) => log::error!("failed to spawn a toggled code action: {e:#}"),
+                },
+                Err(e) => log::error!("failed to toggle code actions: {e:#}"),
+            }
         })
-        .detach_and_log_err(cx);
     }
 
     fn debug_scenarios(
@@ -7135,42 +7176,6 @@ impl Editor {
         .unwrap_or_else(|| Task::ready(vec![]))
     }
 
-    fn code_actions(
-        &mut self,
-        buffer_row: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Option<Rc<[AvailableCodeAction]>>> {
-        let mut task = self.code_actions_task.take();
-        cx.spawn_in(window, async move |editor, cx| {
-            while let Some(prev_task) = task {
-                prev_task.await.log_err();
-                task = editor
-                    .update(cx, |this, _| this.code_actions_task.take())
-                    .ok()?;
-            }
-
-            editor
-                .update(cx, |editor, cx| {
-                    editor
-                        .available_code_actions
-                        .clone()
-                        .and_then(|(location, code_actions)| {
-                            let snapshot = location.buffer.read(cx).snapshot();
-                            let point_range = location.range.to_point(&snapshot);
-                            let point_range = point_range.start.row..=point_range.end.row;
-                            if point_range.contains(&buffer_row) {
-                                Some(code_actions)
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .ok()
-                .flatten()
-        })
-    }
-
     pub fn confirm_code_action(
         &mut self,
         action: &ConfirmCodeAction,
@@ -7207,6 +7212,10 @@ impl Editor {
                 })
             }
             CodeActionsItem::CodeAction { action, provider } => {
+                if code_lens::try_handle_client_command(&action, self, &workspace, window, cx) {
+                    return Some(Task::ready(Ok(())));
+                }
+
                 let apply_code_action =
                     provider.apply_code_action(buffer, action, true, window, cx);
                 let workspace = workspace.downgrade();
@@ -7380,11 +7389,6 @@ impl Editor {
         Ok(())
     }
 
-    pub fn clear_code_action_providers(&mut self) {
-        self.code_action_providers.clear();
-        self.available_code_actions.take();
-    }
-
     pub fn add_code_action_provider(
         &mut self,
         provider: Rc<dyn CodeActionProvider>,
@@ -7400,7 +7404,7 @@ impl Editor {
         }
 
         self.code_action_providers.push(provider);
-        self.refresh_code_actions(window, cx);
+        self.refresh_code_actions_for_selection(window, cx);
     }
 
     pub fn remove_code_action_provider(
@@ -7411,7 +7415,7 @@ impl Editor {
     ) {
         self.code_action_providers
             .retain(|provider| provider.id() != id);
-        self.refresh_code_actions(window, cx);
+        self.refresh_code_actions_for_selection(window, cx);
     }
 
     pub fn code_actions_enabled_for_toolbar(&self, cx: &App) -> bool {
@@ -7419,10 +7423,12 @@ impl Editor {
             && EditorSettings::get_global(cx).toolbar.code_actions
     }
 
-    pub fn has_available_code_actions(&self) -> bool {
-        self.available_code_actions
-            .as_ref()
-            .is_some_and(|(_, actions)| !actions.is_empty())
+    pub fn has_available_code_actions_for_selection(&self) -> bool {
+        if let CodeActionsForSelection::Ready(ready) = &self.code_actions_for_selection {
+            !ready.actions.is_empty()
+        } else {
+            false
+        }
     }
 
     fn render_inline_code_actions(
@@ -7474,73 +7480,88 @@ impl Editor {
         &self.context_menu
     }
 
-    fn refresh_code_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.code_actions_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(CODE_ACTIONS_DEBOUNCE_TIMEOUT)
-                .await;
+    fn refresh_code_actions_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.code_actions_for_selection = CodeActionsForSelection::Fetching(
+            cx.spawn_in(window, async move |editor, cx| {
+                cx.background_executor()
+                    .timer(CODE_ACTIONS_DEBOUNCE_TIMEOUT)
+                    .await;
 
-            let (start_buffer, start, _, end, _newest_selection) = this
-                .update(cx, |this, cx| {
-                    let newest_selection = this.selections.newest_anchor().clone();
-                    if newest_selection.head().diff_base_anchor().is_some() {
-                        return None;
-                    }
-                    let display_snapshot = this.display_snapshot(cx);
-                    let newest_selection_adjusted =
-                        this.selections.newest_adjusted(&display_snapshot);
-                    let buffer = this.buffer.read(cx);
-
-                    let (start_buffer, start) =
-                        buffer.text_anchor_for_position(newest_selection_adjusted.start, cx)?;
-                    let (end_buffer, end) =
-                        buffer.text_anchor_for_position(newest_selection_adjusted.end, cx)?;
-
-                    Some((start_buffer, start, end_buffer, end, newest_selection))
-                })?
-                .filter(|(start_buffer, _, end_buffer, _, _)| start_buffer == end_buffer)
-                .context(
-                    "Expected selection to lie in a single buffer when refreshing code actions",
-                )?;
-            let (providers, tasks) = this.update_in(cx, |this, window, cx| {
-                let providers = this.code_action_providers.clone();
-                let tasks = this
-                    .code_action_providers
-                    .iter()
-                    .map(|provider| provider.code_actions(&start_buffer, start..end, window, cx))
-                    .collect::<Vec<_>>();
-                (providers, tasks)
-            })?;
-
-            let mut actions = Vec::new();
-            for (provider, provider_actions) in
-                providers.into_iter().zip(future::join_all(tasks).await)
-            {
-                if let Some(provider_actions) = provider_actions.log_err() {
-                    actions.extend(provider_actions.into_iter().map(|action| {
-                        AvailableCodeAction {
-                            action,
-                            provider: provider.clone(),
+                let (start_buffer, start, _, end, _newest_selection) = editor
+                    .update(cx, |editor, cx| {
+                        let newest_selection = editor.selections.newest_anchor().clone();
+                        if newest_selection.head().diff_base_anchor().is_some() {
+                            return None;
                         }
-                    }));
-                }
-            }
+                        let display_snapshot = editor.display_snapshot(cx);
+                        let newest_selection_adjusted =
+                            editor.selections.newest_adjusted(&display_snapshot);
+                        let buffer = editor.buffer.read(cx);
 
-            this.update(cx, |this, cx| {
-                this.available_code_actions = if actions.is_empty() {
-                    None
-                } else {
-                    Some((
-                        Location {
-                            buffer: start_buffer,
-                            range: start..end,
-                        },
-                        actions.into(),
-                    ))
-                };
-                cx.notify();
+                        let (start_buffer, start) =
+                            buffer.text_anchor_for_position(newest_selection_adjusted.start, cx)?;
+                        let (end_buffer, end) =
+                            buffer.text_anchor_for_position(newest_selection_adjusted.end, cx)?;
+
+                        Some((start_buffer, start, end_buffer, end, newest_selection))
+                    })
+                    .ok()
+                    .flatten()
+                    .filter(|(start_buffer, _, end_buffer, _, _)| start_buffer == end_buffer)?;
+
+                let (providers, tasks) = editor
+                    .update_in(cx, |editor, window, cx| {
+                        let providers = editor.code_action_providers.clone();
+                        let tasks = editor
+                            .code_action_providers
+                            .iter()
+                            .map(|provider| {
+                                provider.code_actions(&start_buffer, start..end, window, cx)
+                            })
+                            .collect::<Vec<_>>();
+                        (providers, tasks)
+                    })
+                    .ok()?;
+
+                let mut actions = Vec::new();
+                for (provider, provider_actions) in
+                    providers.into_iter().zip(future::join_all(tasks).await)
+                {
+                    if let Some(provider_actions) = provider_actions.log_err() {
+                        actions.extend(provider_actions.into_iter().map(|action| {
+                            AvailableCodeAction {
+                                action,
+                                provider: provider.clone(),
+                            }
+                        }));
+                    }
+                }
+
+                editor
+                    .update(cx, |editor, cx| {
+                        let new_actions = if actions.is_empty() {
+                            editor.code_actions_for_selection = CodeActionsForSelection::None;
+                            None
+                        } else {
+                            let new_actions = ActionFetchReady {
+                                location: Location {
+                                    buffer: start_buffer,
+                                    range: start..end,
+                                },
+                                actions: Rc::from(actions),
+                            };
+                            editor.code_actions_for_selection =
+                                CodeActionsForSelection::Ready(new_actions.clone());
+                            Some(new_actions)
+                        };
+                        cx.notify();
+                        new_actions
+                    })
+                    .ok()
+                    .flatten()
             })
-        }));
+            .shared(),
+        );
     }
 
     fn start_inline_blame_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -24822,7 +24843,7 @@ impl Editor {
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
-                self.refresh_code_actions(window, cx);
+                self.refresh_code_actions_for_selection(window, cx);
                 self.refresh_single_line_folds(window, cx);
                 let snapshot = self.snapshot(window, cx);
                 self.refresh_matching_bracket_highlights(&snapshot, cx);
@@ -25160,6 +25181,12 @@ impl Editor {
                     self.splice_inlays(&inlay_splice.to_remove, inlay_splice.to_insert, cx);
                 }
                 self.refresh_document_colors(None, window, cx);
+            }
+
+            let code_lens_inline = EditorSettings::get_global(cx).code_lens.inline();
+            let was_inline = self.code_lens.is_some();
+            if code_lens_inline != was_inline {
+                self.toggle_code_lens(code_lens_inline, window, cx);
             }
 
             self.refresh_inlay_hints(
@@ -26334,6 +26361,7 @@ impl Editor {
         self.refresh_semantic_tokens(for_buffer, None, cx);
         self.refresh_document_colors(for_buffer, window, cx);
         self.refresh_folding_ranges(for_buffer, window, cx);
+        self.refresh_code_lenses(for_buffer, window, cx);
         self.refresh_document_symbols(for_buffer, cx);
     }
 
@@ -26504,6 +26532,7 @@ impl Editor {
         self.register_visible_buffers(cx);
         self.colorize_brackets(false, cx);
         self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+        self.resolve_visible_code_lenses(cx);
         if !self.buffer().read(cx).is_singleton() || self.needs_initial_data_update {
             self.needs_initial_data_update = false;
             self.update_lsp_data(None, window, cx);
@@ -27760,21 +27789,22 @@ impl CodeActionProvider for Entity<Project> {
         cx: &mut App,
     ) -> Task<Result<Vec<CodeAction>>> {
         self.update(cx, |project, cx| {
-            let code_lens_actions = project.code_lens_actions(buffer, range.clone(), cx);
+            let code_lens_actions = if EditorSettings::get_global(cx).code_lens.show_in_menu() {
+                Some(project.code_lens_actions(buffer, range.clone(), cx))
+            } else {
+                None
+            };
             let code_actions = project.code_actions(buffer, range, None, cx);
             cx.background_spawn(async move {
-                let (code_lens_actions, code_actions) = join(code_lens_actions, code_actions).await;
-                Ok(code_lens_actions
-                    .context("code lens fetch")?
-                    .into_iter()
-                    .flatten()
-                    .chain(
-                        code_actions
-                            .context("code action fetch")?
-                            .into_iter()
-                            .flatten(),
-                    )
-                    .collect())
+                let code_lens_actions = match code_lens_actions {
+                    Some(task) => task.await.context("code lens fetch")?.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let code_actions = code_actions
+                    .await
+                    .context("code action fetch")?
+                    .unwrap_or_default();
+                Ok(code_lens_actions.into_iter().chain(code_actions).collect())
             })
         })
     }
