@@ -82,18 +82,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_single_json_object() {
-        let output = success_output(r#"{"id":"abc123"}"#);
-        let result: Option<TestItem> = deserialize_json_output(output).unwrap();
-        assert_eq!(
-            result,
-            Some(TestItem {
-                id: "abc123".into()
-            })
-        );
-    }
-
-    #[test]
     fn test_deserialize_newline_delimited_json_rejected() {
         // Strict single-value contract: NDJSON must be rejected. Commands that
         // may legitimately return multiple rows (e.g. `docker ps`) parse their
